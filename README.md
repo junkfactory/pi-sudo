@@ -137,3 +137,5 @@ npm test
 ```
 
 `npm run check` runs `tsc --noEmit`. `npm test` runs the Node test runner through `jiti` over `test/**/*.test.ts`. The executor tests use an injected fake spawn function, so they do not need sudo or a password. They cover the dialog, password field, executor invariants, bash guard, escalation and path-token predicates, permission policy mapping, the global mutex, and the tool's early-exit behavior.
+
+The [manual acceptance checklist](./TESTING.md) covers what the suite cannot: a real password, the dialogs, ticket reuse, denials, and the leak checks.
