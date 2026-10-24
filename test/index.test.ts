@@ -255,16 +255,31 @@ describe("bash escalation guard", () => {
     // Absolute paths and wrappers still resolve to the escalator word.
     assert.equal(needsSudoApproval("/usr/bin/sudo id"), true);
     assert.equal(needsSudoApproval("xargs sudo id"), true);
+    assert.equal(needsSudoApproval("xargs -0 sudo id"), true);
     assert.equal(needsSudoApproval("sudo -u root id"), true);
     assert.equal(needsSudoApproval("su -c 'id'"), true);
     assert.equal(needsSudoApproval("echo ok && sudo id"), true);
+    assert.equal(needsSudoApproval("echo ok; sudo id"), true);
+    assert.equal(needsSudoApproval("ls | sudo tee /tmp/x"), true);
     assert.equal(needsSudoApproval("$(sudo id)"), true);
+    assert.equal(needsSudoApproval("timeout 5 sudo id"), true);
+    assert.equal(needsSudoApproval("env FOO=1 sudo id"), true);
+    assert.equal(needsSudoApproval("FOO=1 sudo id"), true);
+    assert.equal(needsSudoApproval("if sudo id; then :; fi"), true);
     // Hyphenated or slashed neighbours are not escalators.
     assert.equal(needsSudoApproval("jj status pi-sudo"), false);
     assert.equal(needsSudoApproval("rg sudo-exec"), false);
     assert.equal(needsSudoApproval("git log --format=%H -- foo-sudo"), false);
     assert.equal(needsSudoApproval("ls /home/papa/Work/pi/pi-sudo"), false);
     assert.equal(needsSudoApproval("catsudo id"), false);
+    // The word as data in an argument is not a command.
+    assert.equal(needsSudoApproval("rg 'sudo' README.md"), false);
+    assert.equal(needsSudoApproval("grep -n sudo README.md"), false);
+    assert.equal(
+      needsSudoApproval('jj describe -m "needs sudo to install"'),
+      false,
+    );
+    assert.equal(needsSudoApproval("echo 'use sudo later'"), false);
   });
 
   it("blocks a bash tool call with the plan's reason", async () => {
@@ -278,7 +293,7 @@ describe("bash escalation guard", () => {
     )) as { block?: boolean; reason?: string } | undefined;
     assert.equal(blocked?.block, true);
     assert.match(blocked?.reason ?? "", /sudo_exec/);
-    assert.match(blocked?.reason ?? "", /grep 'sud\[o\]'/);
+    assert.match(blocked?.reason ?? "", /no leading sudo/);
 
     const allowed = await guard(
       { type: "tool_call", toolName: "bash", toolCallId: "2", input: { command: "ls -la" } },

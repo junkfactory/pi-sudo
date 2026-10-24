@@ -34,7 +34,7 @@ const ATTEMPTS_TEXT =
   "sudo rejected the password 3 times; the command was not executed and nothing else ran. Do not retry this call blindly: confirm with the user that they entered the right password and that the account can use sudo, then try again if needed.";
 
 const SUDO_GUARD_REASON =
-  "`sudo` needs an interactive password prompt, which bash cannot provide here. Use the sudo_exec tool with the command itself (no leading sudo). If you were only searching for the word, dodge the match, e.g. grep 'sud[o]'.";
+  "`sudo` needs an interactive password prompt, which bash cannot provide here. Use the sudo_exec tool with the command itself (no leading sudo).";
 
 const ESCALATOR_WORDS = new Set([
   "sudo",
@@ -47,6 +47,39 @@ const ESCALATOR_WORDS = new Set([
   "systemd-run",
   "nsenter",
 ]);
+
+/**
+ * Words that keep the following token in command position: wrappers, shell
+ * keywords, and option/assignment syntax. A wrapped escalator is still a
+ * command, so `xargs sudo`, `timeout 5 sudo`, and `env FOO=1 sudo` match.
+ */
+const TRANSPARENT_WORDS = new Set([
+  "xargs",
+  "env",
+  "timeout",
+  "nice",
+  "nohup",
+  "exec",
+  "stdbuf",
+  "setsid",
+  "command",
+  "builtin",
+  "time",
+  "if",
+  "then",
+  "else",
+  "elif",
+  "while",
+  "until",
+  "do",
+  "!",
+  "{",
+  "}",
+  "$",
+]);
+
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const NUMBER = /^\d+[A-Za-z]*$/;
 
 const READ_ONLY_COMMAND =
   /^\s*(?:cat|bat|ls|grep|rg|find|less|more|head|tail|stat|file|diff|wc|tree|sha\d+sum|md5sum|realpath|readlink|getfacl|lsattr|systemctl\s+status|journalctl|id|whoami)\b/;
@@ -98,14 +131,32 @@ type PolicyOutcome =
   | { kind: "deny"; surface: string };
 
 /**
- * Bash commands whose command words include a privilege escalator are blocked.
- * Tokens are split on shell punctuation and compared by basename, so
- * `/usr/bin/sudo` and `xargs sudo` match while `pi-sudo` or `sudo-exec` do not.
+ * Bash commands that would run a privilege escalator are blocked. Tokens are
+ * compared by basename in command position only, so `/usr/bin/sudo`,
+ * `xargs sudo`, and `a && sudo` match while `pi-sudo`, `rg 'sudo' file`, or a
+ * commit message that mentions the word do not.
  */
 export function needsSudoApproval(command: string): boolean {
-  return command
-    .split(/[\s;&|<>()`'"=]+/)
-    .some((token) => ESCALATOR_WORDS.has(token.replace(/^.*\//, "")));
+  let commandPosition = true;
+  for (const raw of command.replace(/[;&|()`\n]+/g, " ; ").split(/[\s<>'"{}]+/)) {
+    if (raw === "" || raw === ";") {
+      commandPosition = true;
+      continue;
+    }
+    if (!commandPosition) continue;
+    const token = raw.replace(/^.*\//, "");
+    if (ESCALATOR_WORDS.has(token)) return true;
+    if (
+      TRANSPARENT_WORDS.has(token) ||
+      token.startsWith("-") ||
+      ASSIGNMENT.test(token) ||
+      NUMBER.test(token)
+    ) {
+      continue;
+    }
+    commandPosition = false;
+  }
+  return false;
 }
 
 /** Heuristic: the command can leave lasting root privilege behind. */
