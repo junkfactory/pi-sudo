@@ -162,6 +162,9 @@ describe("EscalationDialog", () => {
   const redTheme: DialogTheme = {
     fg: (color, text) => (color === "error" ? `\u001b[31m${text}\u001b[39m` : text),
   };
+  const CURSOR = "\u001b_pi:c";
+  /** pi-tui hides its fake cursor in ESC _pi:…BEL markers inside the text. */
+  const plain = (line: string): string => line.replace(/\u001b_pi:[^\u0007]*\u0007/g, "");
 
   function escalation(theme: DialogTheme = plainTheme): {
     dialog: ReturnType<typeof createEscalationDialog>;
@@ -184,7 +187,25 @@ describe("EscalationDialog", () => {
     assert.ok(lines.some((line) => line.includes("Run it anyway?")));
     assert.ok(lines.some((line) => line.includes("\u001b[31m")));
     assert.ok(lines.some((line) => line.includes("\u2192 Yes")));
-    assert.ok(lines.some((line) => line.includes("only sent if you decline")));
+    assert.equal(lines.some((line) => line.includes("optional note")), false);
+  });
+
+  it("stacks the options and shows the note field only on the No line", () => {
+    const { dialog } = escalation();
+    const lines = dialog.render(WIDTH);
+    const yes = lines.findIndex((line) => line.includes("\u2192 Yes"));
+    const no = lines.findIndex((line) => line.includes("  No"));
+    assert.equal(no, yes + 1);
+
+    dialog.handleInput("\u001b[B");
+    const noLine = plain(dialog.render(WIDTH).find((line) => line.includes("\u2192 No")) ?? "");
+    assert.ok(noLine.includes("[ optional note for the model"));
+    assert.ok(noLine.trimEnd().endsWith("]"));
+
+    dialog.handleInput("because /etc/x is shared");
+    const typed = plain(dialog.render(WIDTH).find((line) => line.includes("\u2192 No")) ?? "");
+    assert.ok(typed.includes("because /etc/x is shared"));
+    assert.ok(typed.trimEnd().endsWith("]"));
   });
 
   it("approves on Enter and ignores the note", () => {
@@ -192,6 +213,60 @@ describe("EscalationDialog", () => {
     dialog.handleInput("a stray note");
     dialog.handleInput("\r");
     assert.deepEqual(answer(), { approved: true, note: "" });
+  });
+
+  it("keeps the note field inert while Yes is selected", () => {
+    const { dialog, answer } = escalation();
+    dialog.handleInput("typed before choosing No");
+    dialog.handleInput("\u001b[B");
+    dialog.handleInput("\r");
+    assert.deepEqual(answer(), { approved: false, note: "" });
+  });
+
+  it("focuses the note field only while No is selected", () => {
+    const { dialog } = escalation();
+    assert.equal(
+      dialog.render(WIDTH).some((line) => line.includes(CURSOR)),
+      false,
+    );
+    dialog.handleInput("\u001b[B");
+    assert.equal(
+      dialog.render(WIDTH).some((line) => line.includes(CURSOR)),
+      true,
+    );
+    dialog.handleInput("\t");
+    assert.equal(
+      dialog.render(WIDTH).some((line) => line.includes(CURSOR)),
+      false,
+    );
+  });
+
+  it("returns the note only when No was the confirmed option", () => {
+    const typed = escalation();
+    typed.dialog.handleInput("\t");
+    typed.dialog.handleInput("because /etc/x is shared");
+    typed.dialog.handleInput("\r");
+    assert.deepEqual(typed.answer(), {
+      approved: false,
+      note: "because /etc/x is shared",
+    });
+
+    const switched = escalation();
+    switched.dialog.handleInput("\t");
+    switched.dialog.handleInput("not if you approve");
+    switched.dialog.handleInput("\t");
+    switched.dialog.handleInput("\r");
+    assert.deepEqual(switched.answer(), { approved: true, note: "" });
+  });
+
+  it("keeps typed text when toggling back to No", () => {
+    const { dialog, answer } = escalation();
+    dialog.handleInput("\t");
+    dialog.handleInput("kept");
+    dialog.handleInput("\t");
+    dialog.handleInput("\u001b[B");
+    dialog.handleInput("\r");
+    assert.deepEqual(answer(), { approved: false, note: "kept" });
   });
 
   it("moves to No with Down and returns the typed reason", () => {

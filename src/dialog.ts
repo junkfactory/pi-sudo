@@ -350,7 +350,9 @@ const ESCALATION_TITLE = "\u03c0 sudo: lasting privilege change";
 const ESCALATION_WARNING =
   "This command can grant lasting root privilege (sudoers, PAM, account files, SUID/ACL/capability changes, or /etc and /root writes).";
 const ESCALATION_QUESTION = "Run it anyway?";
-const NOTE_LABEL = "Note to the model (only sent if you decline):";
+const NOTE_PLACEHOLDER = "optional note for the model";
+const HINT_APPROVE = "Enter confirms · Esc denies · → or Tab writes a note";
+const HINT_DECLINE = "Enter declines with note · Tab back to Yes · Esc declines";
 const MAX_NOTE_LENGTH = 500;
 
 export interface EscalationAnswer {
@@ -367,32 +369,35 @@ export interface EscalationDialogOptions {
 
 /**
  * One confirmation screen for a command that can leave lasting root privilege
- * behind. Yes is preselected, matching pi's own confirm, but the note field is
- * always focused so the user can decline with a reason or question for the
- * model. Enter confirms the highlighted option; Esc denies without a note.
+ * behind. The options are stacked, Yes is preselected, and the note field hangs
+ * off the No line and only appears once No is selected. It also only takes
+ * keystrokes then, so a note can never ride along with an approval. Enter
+ * confirms the highlighted option; Esc denies without a note.
  */
 export class EscalationDialog implements Component, Focusable {
   readonly #theme: DialogTheme;
   readonly #done: (answer: EscalationAnswer) => void;
   readonly #requestRender: () => void;
-  readonly #input = new Input({ placeholder: "optional" });
+  readonly #input = new Input({ prompt: "[ ", placeholder: NOTE_PLACEHOLDER });
   #selected = 0;
+  #focused = true;
   #closed = false;
 
   constructor(options: EscalationDialogOptions) {
     this.#theme = options.theme;
     this.#done = options.done;
     this.#requestRender = options.requestRender ?? (() => {});
-    this.#input.focused = true;
+    this.#syncInput();
   }
 
   get focused(): boolean {
-    return this.#input.focused;
+    return this.#focused;
   }
 
   set focused(value: boolean) {
-    if (this.#input.focused === value) return;
-    this.#input.focused = value;
+    if (this.#focused === value) return;
+    this.#focused = value;
+    this.#syncInput();
     this.#requestRender();
   }
 
@@ -405,16 +410,19 @@ export class EscalationDialog implements Component, Focusable {
         width,
       ),
       "",
-      truncateToWidth(this.#options(), width),
+      truncateToWidth(this.#yesLine(), width),
+      truncateToWidth(this.#noLine(width), width),
       "",
-      truncateToWidth(theme.fg("dim", NOTE_LABEL), width),
-      ...this.#input.render(width),
-      truncateToWidth(theme.fg("dim", "Enter confirms · Esc denies"), width),
+      truncateToWidth(
+        theme.fg("dim", this.#selected === 1 ? HINT_DECLINE : HINT_APPROVE),
+        width,
+      ),
     ];
     return lines;
   }
 
   handleInput(data: string): void {
+    if (this.#closed) return;
     if (matchesKey(data, Key.escape)) {
       this.#finish(false, false);
       return;
@@ -423,15 +431,17 @@ export class EscalationDialog implements Component, Focusable {
       this.#finish(this.#selected === 0, true);
       return;
     }
-    if (matchesKey(data, Key.left) || matchesKey(data, Key.up)) {
-      this.#select(0);
+    if (matchesKey(data, Key.tab) || matchesKey(data, "shift+tab")) {
+      this.#select(this.#selected === 0 ? 1 : 0);
       return;
     }
-    if (matchesKey(data, Key.right) || matchesKey(data, Key.down)) {
-      this.#select(1);
+    if (this.#selected === 0) {
+      if (matchesKey(data, Key.right) || matchesKey(data, Key.down)) this.#select(1);
       return;
     }
+    // No is selected: every other key edits the note.
     this.#input.handleInput(data);
+    this.invalidate();
   }
 
   invalidate(): void {}
@@ -440,24 +450,44 @@ export class EscalationDialog implements Component, Focusable {
     this.#input.setValue("");
   }
 
-  #options(): string {
-    const theme = this.#theme;
-    const yes =
-      this.#selected === 0 ? theme.fg("accent", "→ Yes") : theme.fg("dim", "  Yes");
-    const no = this.#selected === 1 ? theme.fg("accent", "→ No") : theme.fg("dim", "  No");
-    return `${yes}    ${no}`;
+  #yesLine(): string {
+    return this.#selected === 0
+      ? this.#theme.fg("accent", "→ Yes")
+      : this.#theme.fg("dim", "  Yes");
+  }
+
+  /** The note field only exists on the No line, so it can never ride along with Yes. */
+  #noLine(width: number): string {
+    const no =
+      this.#selected === 1
+        ? this.#theme.fg("accent", "→ No")
+        : this.#theme.fg("dim", "  No");
+    if (this.#selected !== 1) return no;
+    const prefix = `${no}  `;
+    const [field = ""] = this.#input.render(
+      Math.max(12, width - visibleWidth(prefix) - 1),
+    );
+    return `${prefix}${field.replace(/\s+$/, "")} ]`;
   }
 
   #select(index: number): void {
     if (this.#selected === index) return;
     this.#selected = index;
+    this.#syncInput();
     this.#requestRender();
+  }
+
+  #syncInput(): void {
+    this.#input.focused = this.#focused && this.#selected === 1;
   }
 
   #finish(approved: boolean, keepNote: boolean): void {
     if (this.#closed) return;
     this.#closed = true;
-    const note = approved || !keepNote ? "" : sanitizeNote(this.#input.getValue());
+    const note =
+      approved || !keepNote || this.#selected !== 1
+        ? ""
+        : sanitizeNote(this.#input.getValue());
     this.#input.setValue("");
     this.#done({ approved, note });
   }
