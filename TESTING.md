@@ -16,24 +16,26 @@ Expected: typecheck silent, Node test runner reports all tests passing.
 
 ## Leak checks
 
-Run these right after a real password was typed, with the session still open.
+Run these right after a real password was typed, with the session still open. Only the person who owns the password can run them: an agent must not have the secret, so it cannot search for it. Type the password with echo off and let `rg` read it from a FIFO as a pattern file: that keeps the secret out of argv, out of the shell history, and out of any process list.
 
 ```bash
-# The password must not reach persisted sessions, logs, or ad-hoc files.
-grep -R --binary-files=text -F '<password>' ~/.pi/agent/sessions            # no match
-grep -R --binary-files=text -F '<password>' ~/.pi/agent                      # no match
-grep -R --binary-files=text -F '<password>' /tmp                             # no match
-
-# ... and it must not be visible in process arguments while a run is active.
-ps -eo args | grep -F '<password>'                                          # no match
-ps -eo args | grep -F sudo                                                  # only pi's own argv
+read -rsp 'pw: ' PW; printf '\n'
+rg -c -F -f <(printf '%s' "$PW") ~/.pi/agent/sessions || echo 'no match: password not stored'
+rg -c -F -f <(printf '%s' "$PW") ~/.pi/agent          || echo 'no match: nothing else under ~/.pi/agent'
+ps -eo pid,args | rg -i 'sud[o]'                       # only pi's own process, no sudo process
+unset PW
 ```
 
-Expected: `no match` everywhere, and no `sudo` process whose argv carries the password. The password travels to `sudo` over stdin, never through argv or the environment.
+Expected: `no match` from both greps. A count above zero is a leak, so stop and find where the bytes were persisted. The `ps` line shows pi itself loading the extension by path, for example `pi -e pi-sudo/extensions/index.ts -c`, and must never show a sudo process carrying the password: the secret reaches sudo over stdin, never through argv or the environment.
+
+Two things that look like leaks and are not:
+
+- A stored session record of a prompt contains the nonce prompt, for example `[pi-sudo:28c630effe2d8837] password:`. The nonce is public by design and the secret is not part of it.
+- `ps` lists pi, because pi is what loaded the extension. Only sudo argv matters for this check.
 
 ## Manual acceptance
 
-Confirm each row in a fresh session with `pi -ne -e /home/papa/Work/pi/pi-sudo`. Use `/tmp` paths for anything written, so no check leaves system state behind.
+Rows 1 to 7 are the release gate and map to the acceptance items used for the last sign-off. Rows 8 to 14 are regression checks for paths a normal run may not touch. Confirm each row in a fresh session with `pi -ne -e /home/papa/Work/pi/pi-sudo`. Use `/tmp` paths for anything written, so no check leaves system state behind.
 
 | #  | Check           | How                                                                                                   | Expected                                                                                                                                                                                                                                |
 |----|-----------------|-------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
