@@ -33,7 +33,7 @@ Start a new pi session after installing. The package registers its extension fro
 The approval dialog shows:
 
 - The header `π sudo: approve root command`.
-- The sanitized command. ANSI/OSC/CSI escapes and control bytes are removed, tabs become spaces, CR and LF become visible `<CR>` and `<LF>` markers, and invisible/format characters become visible `U+XXXX` markers.
+- The sanitized command. Nothing is dropped: every byte the shell will receive is on screen. ANSI escapes, control bytes, and invisible/format characters become visible `<U+XXXX>` markers, tabs become spaces, and CR and LF become visible `<CR>` and `<LF>` markers. An escape sequence cannot hide a line of shell.
 - `Reason:` followed by the model's one-line reason for the request, sanitized like the command and shortened to one display line.
 - A masked password field that renders bullets, never the typed text.
 - On a retry, sudo's first error line above the field.
@@ -41,7 +41,7 @@ The approval dialog shows:
 
 When the wrapped command preview fits in 10 lines, the whole command is visible and Enter approves and runs it. When it is longer, Enter is disabled until the preview has been scrolled to the last line. Use Up/Down, PgUp/PgDn, Home, or End to scroll.
 
-Esc denies the request. Enter with an empty password also denies it. A denial runs nothing and returns an error result that tells the model not to retry the same command and to explain why root was needed.
+Esc denies the request. Enter with an empty password also denies it. A denial runs no privileged command and returns an error result that tells the model not to retry the same command and to explain why root was needed. If sudo's ticket was already valid, the command had already run during the warm probe, before any dialog.
 
 A wrong password reopens the dialog with sudo's error for up to three attempts. Only sudo's `Sorry, try again.` response is retried; other failures fail immediately. After the third rejection the result states that nothing was executed and asks the agent to confirm the password with the user instead of retrying blindly.
 

@@ -189,7 +189,12 @@ export class PasswordField implements Component, Focusable {
 
   #append(text: string): void {
     if (text.length === 0) return;
-    this.#bytes = Buffer.concat([this.#bytes, Buffer.from(text, "utf8")]);
+    const added = Buffer.from(text, "utf8");
+    const previous = this.#bytes;
+    this.#bytes = Buffer.concat([previous, added]);
+    // Buffer.concat copies, so the two inputs are dead weight: clear them.
+    previous.fill(0);
+    added.fill(0);
   }
 
   #dropLastSequence(): void {

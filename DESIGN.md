@@ -33,11 +33,11 @@ The tool is registered with `exposure: "model-only"` and `executionMode: "sequen
 The hard part is telling sudo's prompt apart from command output, because the command's stdout and stderr are model-visible.
 
 - **Nonce prompt.** Each run generates a random nonce and passes `-p "[pi-sudo:<hex>] password:"`. The executor writes the password only after that exact line appears on the executor's own stderr pipe, and only once. A forged marker in command output cannot reach that pipe.
-- **stderr isolation.** The command's stderr is redirected inside the payload: `/bin/sh -c 'exec 2>"<errfile>"; <command>'`. The errfile is `0600` inside a private `0700` run directory. After exit its contents are merged into model-visible output under `--- stderr ---`, and the directory is removed. So the pipe carrying sudo's messages carries nothing the command can write.
+- **stderr merge.** The payload is `/bin/sh -c 'exec 2>&1; <command>'`, so the command's own stderr joins its stdout on the model-visible pipe. The executor's stderr pipe therefore carries only sudo's messages, which makes the nonce latch unspoofable by ordinary command output. There is no errfile: an earlier version redirected the command's stderr into a `0600` file inside a `0700` directory and let the root shell open that path, which gave a same-UID process a symlink race against a root-owned open, and left an unbounded file on disk. Merging needs no path and no cleanup; stdout and stderr interleave instead of arriving in two sections.
 - **Two writes.** The password buffer goes to stdin first, then `"\n"` as a separate write, then stdin ends. A single write would let sudo consume the newline as part of the password when the buffer is delivered in one chunk.
 - **Zeroing.** The buffer is zeroed on stdin `finish` or child `close`, whichever comes first, and deliberately not before close: Node may hand the buffer to libuv without copying.
 - **No exit code trust for the prompt.** If the nonce never appears within five seconds, stdin is ended without writing. Zero exit then means the command ran warm; non-zero is a failure. Neither branch writes the password.
-- **What is never written.** Not the sudo argv, the environment, the errfile, the full-output file, tool details, notifications, logs, or the session. Tool details are `command`, `exitCode`, `durationMs`, `attempts`, `warm`, `policyChecked`.
+- **What is never written.** Not the sudo argv, the environment, the full-output file, tool details, notifications, logs, or the session. Tool details are `command`, `exitCode`, `durationMs`, `attempts`, `warm`, `policyChecked`.
 
 `PasswordField` stores the value in a `Buffer`, renders bullets, and returns a copy from `take()` truncated at the first CR or LF, so a paste with a trailing newline cannot corrupt the password. pi's own `Input` component stores strings, which is why it is not used.
 
@@ -104,7 +104,7 @@ Full output that exceeds the model-visible cap is written to a `0600` file insid
 
 ## Startup temp sweep
 
-On `session_start` the extension removes every `pi-sudo-*` directory under the system temp directory. Per-run directories are already removed at the end of each run; retained full-output directories are cleaned up here. There is no age check and no coordination with other pi processes, so a concurrent process can lose an in-progress directory. A pid- or age-based sweep would fix that and is the obvious follow-up.
+On `session_start` the extension removes every `pi-sudo-*` directory under the system temp directory. A run creates no directory of its own; only truncated full output is materialized, and those directories are cleaned up here. There is no age check and no coordination with other pi processes, so a concurrent process can lose an in-progress directory. A pid- or age-based sweep would fix that and is the obvious follow-up.
 
 ## Guarantees
 
@@ -114,7 +114,9 @@ On `session_start` the extension removes every `pi-sudo-*` directory under the s
 - A missing sudo binary produces a fixed error.
 - A policy deny is reported before the dialog or any spawn.
 - Only one dialog can be open per pi process, keyed on `globalThis` so in-process subagent nodes share it.
-- Command output cannot reach the executor's stderr pipe, so ordinary writes cannot forge the nonce, the password-required line, or the retry text.
+- Command output cannot reach the executor's stderr pipe, because the command's stderr is merged into its stdout, so ordinary writes cannot forge the nonce, the password-required line, or the retry text.
+- Retained output is capped at 2 MiB; a command past it is terminated and the result says the limit was reached.
+- A password already taken from the dialog is zeroed even when the run fails before spawning.
 - Both spawns use `LC_ALL=C`, so sudo's detection strings are deterministic.
 - A stdin error cannot throw with the password live.
 - An abort or timeout sends SIGTERM, then SIGKILL after three seconds.
@@ -126,7 +128,7 @@ On `session_start` the extension removes every `pi-sudo-*` directory under the s
 Intentional limits for this version. Read them before relying on the tool.
 
 - **Other extensions can see keystrokes.** `ctx.ui.onTerminalInput` receives raw input before the dialog component, so a malicious extension can read the password as it is typed. This cannot be fixed inside `pi-sudo`.
-- **The terminal is shared.** The sudo child is not detached, so it shares pi's controlling terminal and sudo's tty ticket. A root command can print a fake prompt or read `/dev/tty` to phish the user. Command stderr isolation keeps ordinary output off the executor's pipe, but a root command can reopen it via `/proc/<sudo-pid>/fd/2`; that matters only if the ticket warmed between probe and run, and in that state sudo already runs commands without a dialog.
+- **The terminal is shared.** The sudo child is not detached, so it shares pi's controlling terminal and sudo's tty ticket. A root command can print a fake prompt or read `/dev/tty` to phish the user. Merging the command's stderr into its stdout keeps ordinary output off the executor's pipe, but a root command can still reopen that pipe via `/proc/<sudo-pid>/fd/2`; that matters only if the ticket warmed between probe and run, and in that state sudo already runs commands without a dialog.
 - **The bash guard is a nudge.** Only the `bash` tool, only command position, only this word list. Extension-provided shell tools and replaced bash tools are outside it.
 - **Path checks are heuristic.** Tokens are split on whitespace and shell punctuation and resolved against the working directory, with `~/` against the home directory. Paths inside variables, shell expansions, or a program's own arguments escape them. The dialog remains the gate.
 - **Signals may not reach grandchildren.** SIGTERM goes to sudo; sudo normally relays it, but the SIGKILL goes to the sudo process.
@@ -135,7 +137,7 @@ Intentional limits for this version. Read them before relying on the tool.
 - **Buffer hygiene is best-effort.** Buffers are zeroed after close and the field is cleared on denial, but Node strings, Buffers, libuv, terminal input, and garbage-collected copies can retain bytes. The code avoids converting the password to a string or logging it; JavaScript cannot guarantee erasure.
 - **The tool is TUI-only.** RPC, JSON, and print modes fail closed.
 - **The ticket window is high risk by design.** Once a run authenticates, commands run as root without a dialog until sudo's window expires. Policy checks and escalation confirmations still run, and `/sudo-forget` clears it.
-- **The temp sweep has no age check.** See above.
+- **The temp sweep has no age check.** It now only removes retained full-output directories, since a run creates none of its own. See above.
 
 ## Rejected alternatives
 
@@ -144,4 +146,5 @@ Intentional limits for this version. Read them before relying on the tool.
 - **`sudo -k` after each run.** Turns every call cold and defeats the point of a warm ticket.
 - **`ctx.ui.confirm` for the escalation gate.** No colour, no note, and Yes is forced.
 - **Intercepting `sudo` inside the bash tool.** Hides escalation in a general tool and requires parsing shell syntax.
+- **Root-side stderr redirection to a file.** Removed after review: the root shell opened a path that a same-UID process could replace with a symlink, and it left an unbounded file on disk. `exec 2>&1` gives the same isolation without a path.
 - **Biometric or polkit authenticator.** Not in this version; no `Authenticator` seam exists yet, so adding one means adding the seam first.

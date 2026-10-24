@@ -2,9 +2,9 @@ import { spawn } from "node:child_process";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, lstat, mkdtemp, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { join } from "node:path";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 
 const RUN_DIR_PREFIX = "pi-sudo-";
@@ -12,6 +12,9 @@ const DEFAULT_TIMEOUT_SEC = 120;
 const NO_PROMPT_MS = 5000;
 const KILL_GRACE_MS = 3000;
 const STDERR_SCAN_BYTES = 64 * 1024;
+/** Retained command output; a command past this is terminated rather than buffered. */
+const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
+const CAPTURE_LIMIT_NOTE = "\n[output limit reached; the command was terminated]\n";
 const PASSWORD_REQUIRED = /^sudo: a password is required$/m;
 const RETRY_MESSAGE = "Sorry, try again.";
 
@@ -20,7 +23,7 @@ export type SpawnFn = (command: string, args: string[], options: SpawnOptions) =
 export type FailCode = "sudo-missing" | "spawn-failed" | "temp-dir-failed" | "output-lost" | "aborted";
 
 const FAIL_MESSAGES: Readonly<Record<FailCode, string>> = {
-  "sudo-missing": "sudo was not found at /usr/bin/sudo or on PATH; pi-sudo cannot run privileged commands.",
+  "sudo-missing": "sudo was not found at /usr/bin/sudo; pi-sudo cannot run privileged commands.",
   "spawn-failed": "sudo could not be started; nothing ran.",
   "temp-dir-failed": "pi-sudo could not create a private temporary directory; nothing ran.",
   "output-lost": "The full command output could not be written to a secure file and was lost.",
@@ -95,16 +98,15 @@ export interface ForgetTicketOutcome {
   stderr: string;
 }
 
-/** `/usr/bin/sudo` when it exists, otherwise the first `sudo` on PATH. */
+/**
+ * The only sudo pi-sudo will run. PATH is deliberately not consulted: the
+ * process that receives the password must be a known absolute path, never a
+ * name an attacker can shadow.
+ */
 export function resolveSudo(): string {
   const fixed = "/usr/bin/sudo";
-  if (existsSync(fixed)) return fixed;
-  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
-    if (dir.length === 0) continue;
-    const candidate = join(dir, "sudo");
-    if (existsSync(candidate)) return candidate;
-  }
-  throw fail("sudo-missing");
+  if (!existsSync(fixed)) throw fail("sudo-missing");
+  return fixed;
 }
 
 /** The warm probe runs the real command; only password-required prompts defer to the dialog. */
@@ -187,53 +189,17 @@ function makeNonce(): string {
   return `[pi-sudo:${randomBytes(8).toString("hex")}] password: `;
 }
 
-function quoteForDoubleQuotes(value: string): string {
-  return value.replace(/[\\"$`]/g, (char) => `\\${char}`);
-}
-
-function buildPayload(command: string, errfile: string): string {
-  return `exec 2>"${quoteForDoubleQuotes(errfile)}"; ${command}`;
-}
-
-function joinStderr(commandStderr: string, sudoStderr: string): string {
-  if (commandStderr.length === 0) return sudoStderr;
-  if (sudoStderr.length === 0) return commandStderr;
-  return commandStderr.endsWith("\n") ? commandStderr + sudoStderr : `${commandStderr}\n${sudoStderr}`;
-}
-
-function mergeOutput(stdout: string, stderr: string): string {
-  if (stderr.length === 0) return stdout;
-  const head = stdout.length === 0 || stdout.endsWith("\n") ? stdout : `${stdout}\n`;
-  return `${head}--- stderr ---\n${stderr}`;
-}
-
-async function makeRunDir(): Promise<string> {
-  let dir: string;
-  try {
-    dir = await mkdtemp(join(tmpdir(), RUN_DIR_PREFIX));
-    await chmod(dir, 0o700);
-  } catch {
-    throw fail("temp-dir-failed");
-  }
-  return dir;
-}
-
-async function makeErrfile(dir: string): Promise<string> {
-  const errfile = join(dir, "stderr");
-  try {
-    await writeFile(errfile, "", { mode: 0o600, flag: "wx" });
-    await chmod(errfile, 0o600);
-  } catch {
-    await rm(dir, { recursive: true, force: true }).catch(() => {});
-    throw fail("temp-dir-failed");
-  }
-  return errfile;
+/**
+ * The command's own stderr is merged into its stdout, so the stderr pipe carries
+ * only sudo's messages. That keeps the nonce latch unspoofable without giving
+ * root a pathname to reopen: no errfile, no symlink race.
+ */
+function buildPayload(command: string): string {
+  return `exec 2>&1; ${command}`;
 }
 
 interface CollectArgs {
   command: string;
-  dir: string;
-  errfile: string;
   stdout: string;
   sudoStderr: string;
   exitCode: number | null;
@@ -247,16 +213,7 @@ interface CollectArgs {
 }
 
 async function collectResult(args: CollectArgs): Promise<ExecResult> {
-  let commandStderr = "";
-  try {
-    commandStderr = await readFile(args.errfile, "utf8");
-  } catch {
-    commandStderr = "";
-  }
-  await unlink(args.errfile).catch(() => {});
-  await rm(args.dir, { recursive: true, force: true }).catch(() => {});
-
-  const full = mergeOutput(args.stdout, joinStderr(commandStderr, args.sudoStderr));
+  const full = args.stdout.length === 0 ? args.sudoStderr : args.stdout + args.sudoStderr;
   const tail = truncateTail(full);
   let output = tail.content;
   let fullOutputPath: string | null = null;
@@ -306,33 +263,32 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
     killGraceMs = KILL_GRACE_MS,
   } = options;
 
-  if (signal?.aborted) throw fail("aborted");
-
-  const sudo = resolveSudo();
-  const dir = await makeRunDir();
-  const errfile = await makeErrfile(dir);
   const nonce = makeNonce();
-  const payload = buildPayload(command, errfile);
-  const argv =
-    password === undefined
-      ? ["-n", "-p", nonce, "--", "/bin/sh", "-c", payload]
-      : ["-S", "-p", nonce, "--", "/bin/sh", "-c", payload];
-
   let child: ChildProcess;
   try {
+    if (signal?.aborted) throw fail("aborted");
+    const sudo = resolveSudo();
+    const payload = buildPayload(command);
+    const argv =
+      password === undefined
+        ? ["-n", "-p", nonce, "--", "/bin/sh", "-c", payload]
+        : ["-S", "-p", nonce, "--", "/bin/sh", "-c", payload];
     child = spawnFn(sudo, argv, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, LC_ALL: "C" },
       detached: false,
     });
-  } catch {
-    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  } catch (error) {
+    // The password was already taken from the dialog, so nothing else can clear it.
+    password?.fill(0);
+    if (error instanceof SudoError) throw error;
     throw fail("spawn-failed");
   }
 
   const startedAt = Date.now();
   let stdout = "";
+  let captureCapped = false;
   let sudoStderr = "";
   let wroteOnce = false;
   let promptSeen = false;
@@ -413,7 +369,15 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
   child.once("close", zeroPassword);
 
   child.stdout?.on("data", (chunk: Buffer | string) => {
+    if (captureCapped) return;
     const text = chunk.toString();
+    if (stdout.length + text.length > MAX_CAPTURE_BYTES) {
+      captureCapped = true;
+      stdout = stdout.slice(0, MAX_CAPTURE_BYTES) + CAPTURE_LIMIT_NOTE;
+      onOutput?.(CAPTURE_LIMIT_NOTE);
+      terminate();
+      return;
+    }
     stdout += text;
     onOutput?.(text);
   });
@@ -460,9 +424,8 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
       settled = true;
       clearTimers();
       signal?.removeEventListener("abort", onAbort);
-      void rm(dir, { recursive: true, force: true })
-        .catch(() => {})
-        .then(() => reject(fail("spawn-failed")));
+      zeroPassword();
+      reject(fail("spawn-failed"));
     });
 
     child.once("close", (code, closeSignal) => {
@@ -476,8 +439,6 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
 
       void collectResult({
         command,
-        dir,
-        errfile,
         stdout,
         sudoStderr,
         exitCode: code,

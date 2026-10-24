@@ -84,11 +84,8 @@ function nonceFrom(args: string[]): string {
   return nonce;
 }
 
-function errfileFrom(args: string[]): string {
-  const payload = args[args.length - 1];
-  const match = /^exec 2>"(.*)";/.exec(payload);
-  assert.ok(match !== null, `unexpected payload: ${payload}`);
-  return match[1].replace(/\\(["\\$`])/g, "$1");
+function payloadFrom(args: string[]): string {
+  return args[args.length - 1];
 }
 
 function prompt(child: FakeChild, nonce: string): void {
@@ -102,7 +99,7 @@ function mode(file: string): Promise<number> {
 const PASSWORD = "s3cret-pw";
 
 describe("executor", () => {
-  it("warm probe runs the real command with -n, LC_ALL=C, and a non-detached private errfile", async () => {
+  it("warm probe runs the real command with -n, LC_ALL=C, and merged stderr", async () => {
     const { records, spawnFn } = makeSpawn();
     const run = runWarm({ command: "id -u", cwd: "/tmp", spawnFn });
     const rec = await nextSpawn(records);
@@ -110,7 +107,7 @@ describe("executor", () => {
     assert.equal(rec.cmd, resolveSudo());
     assert.deepEqual(rec.args.slice(0, 4), ["-n", "-p", nonceFrom(rec.args), "--"]);
     assert.deepEqual(rec.args.slice(3), ["--", "/bin/sh", "-c", rec.args[6]]);
-    assert.match(rec.args[6], /^exec 2>"[^"]+"; id -u$/);
+    assert.equal(payloadFrom(rec.args), "exec 2>&1; id -u");
     assert.equal(rec.opts.detached, false);
     assert.equal(rec.opts.env?.LC_ALL, "C");
     assert.deepEqual(rec.opts.stdio, ["pipe", "pipe", "pipe"]);
@@ -137,10 +134,11 @@ describe("executor", () => {
     assert.equal(rec.opts.detached, false);
     assert.equal(rec.opts.env?.LC_ALL, "C");
 
-    const errfile = errfileFrom(rec.args);
-    assert.equal(await mode(errfile), 0o600);
-    assert.equal(await mode(dirname(errfile)), 0o700);
-    await writeFile(errfile, "command stderr\n");
+    const payload = payloadFrom(rec.args);
+    assert.equal(payload, "exec 2>&1; id -u");
+
+    // The command's stderr now shares its stdout pipe.
+    rec.child.stdout.emit("data", Buffer.from("command stderr\n"));
 
     prompt(rec.child, nonce);
     assert.equal(rec.child.stdin.writes.length, 2);
@@ -164,8 +162,12 @@ describe("executor", () => {
     assert.equal(outcome.result.ok, true);
     assert.equal(outcome.result.warm, false);
     assert.equal(outcome.result.promptSeen, true);
-    assert.match(outcome.result.output, /^--- stderr ---\ncommand stderr\n/);
-    await assert.rejects(stat(errfile), { code: "ENOENT" });
+    assert.match(outcome.result.output, /^command stderr\n/);
+    assert.equal(
+      outcome.result.output.includes("command stderr"),
+      true,
+      "command output stays model-visible",
+    );
     assert.equal(
       records.every((entry) => !entry.args.includes("-k")),
       true,
@@ -237,23 +239,25 @@ describe("executor", () => {
       noPromptMs: 25,
     });
     const rec = await nextSpawn(cold.records);
-    const errfile = errfileFrom(rec.args);
-    await writeFile(errfile, `${nonceFrom(rec.args)}\nsudo: a password is required\n`);
+    // The command writes the forged text to its own stderr, which is its stdout now.
+    rec.child.stdout.emit(
+      "data",
+      Buffer.from(`${nonceFrom(rec.args)}\nsudo: a password is required\n`),
+    );
     await tick(60);
     assert.equal(rec.child.stdin.writes.length, 0, "command stderr must never feed the detector");
     rec.child.finish(1);
     const coldOutcome = await run;
     assert.equal(coldOutcome.status, "ran", "no retry without a real sudo prompt");
     assert.equal(coldOutcome.result.promptSeen, false);
-    assert.match(coldOutcome.result.output, /--- stderr ---/);
     assert.match(coldOutcome.result.output, /sudo: a password is required/);
 
     const warm = makeSpawn();
     const probe = runWarm({ command: "true", cwd: "/tmp", spawnFn: warm.spawnFn });
     const warmRec = await nextSpawn(warm.records);
-    await writeFile(
-      errfileFrom(warmRec.args),
-      `${nonceFrom(warmRec.args)}\nsudo: a password is required\n`,
+    warmRec.child.stdout.emit(
+      "data",
+      Buffer.from(`${nonceFrom(warmRec.args)}\nsudo: a password is required\n`),
     );
     warmRec.child.finish(0);
     const warmOutcome = await probe;
@@ -450,6 +454,54 @@ describe("executor", () => {
       await rm(keep, { recursive: true, force: true });
       await rm(stale, { recursive: true, force: true }).catch(() => {});
       await rm(other, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it("resolveSudo ignores PATH and only accepts the absolute path", () => {
+    const original = process.env.PATH;
+    try {
+      process.env.PATH = "/nonexistent-shadow-dir";
+      assert.equal(resolveSudo(), "/usr/bin/sudo");
+    } finally {
+      process.env.PATH = original;
+    }
+  });
+
+  it("zeroes a taken password when the spawn throws", async () => {
+    const password = Buffer.from(PASSWORD);
+    const throwing: SpawnFn = () => {
+      throw new Error("spawn blew up");
+    };
+    await assert.rejects(
+      runCold({ command: "true", cwd: "/tmp", password, spawnFn: throwing }),
+      (error: unknown) => error instanceof SudoError && error.code === "spawn-failed",
+    );
+    assert.equal(password.every((byte) => byte === 0), true);
+  });
+
+  it("zeroes a taken password when the request was already aborted", async () => {
+    const password = Buffer.from(PASSWORD);
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      runCold({ command: "true", cwd: "/tmp", password, spawnFn: makeSpawn().spawnFn, signal: controller.signal }),
+      (error: unknown) => error instanceof SudoError && error.code === "aborted",
+    );
+    assert.equal(password.every((byte) => byte === 0), true);
+  });
+
+  it("caps retained output and terminates a command that floods it", async () => {
+    const { records, spawnFn } = makeSpawn();
+    const run = runWarm({ command: "yes", cwd: "/tmp", spawnFn });
+    const rec = await nextSpawn(records);
+    rec.child.stdout.emit("data", Buffer.from("x".repeat(3 * 1024 * 1024)));
+    assert.equal(rec.child.kills.includes("SIGTERM"), true);
+    rec.child.finish(null, "SIGTERM");
+    const outcome = await run;
+    assert.equal("ran" in outcome, true);
+    if ("ran" in outcome) {
+      assert.match(outcome.result.output, /\[output limit reached; the command was terminated\]/);
+      assert.equal(outcome.result.ok, false);
     }
   });
 

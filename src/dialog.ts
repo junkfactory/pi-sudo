@@ -31,65 +31,14 @@ function isFormatCodePoint(cp: number): boolean {
 }
 
 /**
- * Remove ANSI/CSI/OSC (and APC/PM/SS3) sequences without trusting the chunk to
- * be well formed: a malformed sequence is dropped, never rendered raw.
- */
-function stripEscapes(text: string): string {
-  let out = "";
-  let i = 0;
-  while (i < text.length) {
-    if (text.charCodeAt(i) !== 0x1b) {
-      out += text[i];
-      i += 1;
-      continue;
-    }
-    const kind = text[i + 1];
-    if (kind === undefined) {
-      i += 1; // lone ESC
-      continue;
-    }
-    if (kind === "[") {
-      let j = i + 2;
-      while (j < text.length) {
-        const code = text.charCodeAt(j);
-        j += 1;
-        if (code >= 0x40 && code <= 0x7e) break; // final byte
-        if (code < 0x20 || code > 0x3f) break; // malformed: stop swallowing
-      }
-      i = j;
-      continue;
-    }
-    if (kind === "]" || kind === "P" || kind === "_" || kind === "^" || kind === "X") {
-      // String sequences end with BEL or ST (ESC \).
-      let j = i + 2;
-      while (j < text.length) {
-        const code = text.charCodeAt(j);
-        if (code === 0x07) {
-          j += 1;
-          break;
-        }
-        if (code === 0x1b) {
-          j += text[j + 1] === "\\" ? 2 : 1;
-          break;
-        }
-        j += 1;
-      }
-      i = j;
-      continue;
-    }
-    i += 2; // SS3 and other two-byte sequences
-  }
-  return out;
-}
-
-/**
- * Render a model-supplied command so what the user reads is what executes:
- * escapes and control bytes are removed, format characters become visible
- * markers, tabs become two spaces, and CR/LF become visible markers.
+ * Render model-supplied text so what the user reads is what runs: every byte
+ * that cannot be displayed becomes a visible marker instead of disappearing.
+ * Dropping escape-sequence bodies would let a command hide whole shell lines
+ * from the approver while `/bin/sh` still executed them, so nothing is removed.
  */
 export function sanitizeForDisplay(command: string): string {
   let out = "";
-  for (const ch of stripEscapes(command)) {
+  for (const ch of command) {
     const cp = ch.codePointAt(0) ?? 0;
     if (ch === "\t") {
       out += "  ";
@@ -97,9 +46,7 @@ export function sanitizeForDisplay(command: string): string {
       out += "<CR>";
     } else if (ch === "\n") {
       out += "<LF>";
-    } else if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f)) {
-      // C0 (minus tab/CR/LF above), DEL, and C1 controls are not displayable.
-    } else if (isFormatCodePoint(cp)) {
+    } else if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f) || isFormatCodePoint(cp)) {
       out += `<U+${cp.toString(16).toUpperCase().padStart(4, "0")}>`;
     } else {
       out += ch;

@@ -43,12 +43,26 @@ const ENTER = "\r";
 const ESC = "\x1b";
 
 describe("sanitizeForDisplay", () => {
-  it("strips ANSI/CSI/OSC so escapes cannot hide text", () => {
+  it("renders escape sequences instead of hiding the text inside them", () => {
     const command = "rm -rf \x1b[2J/tmp/x\x1b[31m\x1b]0;hidden-title\x07 done";
     const sanitized = sanitizeForDisplay(command);
     assert.ok(!sanitized.includes("\x1b"), JSON.stringify(sanitized));
-    assert.equal(sanitized, "rm -rf /tmp/x done");
-    assert.ok(!sanitized.includes("hidden-title"));
+    assert.equal(
+      sanitized,
+      "rm -rf <U+001B>[2J/tmp/x<U+001B>[31m<U+001B>]0;hidden-title<U+0007> done",
+    );
+    // Every byte the shell will see is on screen, including OSC bodies.
+    assert.ok(sanitized.includes("hidden-title"));
+  });
+
+  it("cannot hide a shell line inside an escape sequence", () => {
+    // This is the shape that used to render as "true<LF>" while the shell ran
+    // the hidden redirect on the next line.
+    const command = "true\n\x1b]x\n: > /tmp/pi-sudo-hidden\n#\x07";
+    const sanitized = sanitizeForDisplay(command);
+    assert.ok(!sanitized.includes("\x1b"), JSON.stringify(sanitized));
+    assert.ok(sanitized.includes(": > /tmp/pi-sudo-hidden"), sanitized);
+    assert.equal(sanitized.startsWith("true<LF>"), true);
   });
 
   it("renders bidi and invisible format characters as visible markers", () => {
@@ -68,8 +82,11 @@ describe("sanitizeForDisplay", () => {
     assert.equal(sanitizeForDisplay("a\r\nb"), "a<CR><LF>b");
   });
 
-  it("drops C0, DEL, and C1 control bytes", () => {
-    assert.equal(sanitizeForDisplay("a\x00\x07\x7f\x9bb"), "ab");
+  it("renders C0, DEL, and C1 control bytes as markers", () => {
+    assert.equal(
+      sanitizeForDisplay("a\x00\x07\x7f\x9bb"),
+      "a<U+0000><U+0007><U+007F><U+009B>b",
+    );
   });
 });
 
@@ -81,7 +98,7 @@ describe("ApprovalDialog", () => {
 
     assert.ok(!rendered.includes("\x1b"), rendered);
     assert.ok(!/[\u202a-\u202e\u200b-\u200f\u2066-\u2069]/u.test(rendered), rendered);
-    assert.ok(rendered.includes("echo safe "));
+    assert.ok(rendered.includes("echo <U+001B>[2Jsafe "), rendered);
     assert.ok(rendered.includes("U+202E"));
     assert.ok(rendered.indexOf("safe") < rendered.indexOf("reversed"));
     assert.ok(rendered.indexOf("reversed") < rendered.indexOf("tail"));
@@ -289,7 +306,7 @@ describe("EscalationDialog", () => {
 
   it("strips control characters and keeps the note on one line", () => {
     assert.equal(sanitizeNote("line one\tline two"), "line one line two");
-    assert.equal(sanitizeNote("a\nb\u001b[31mred"), "a bred");
+    assert.equal(sanitizeNote("a\nb\u001b[31mred"), "a b [31mred");
     assert.equal(sanitizeNote("\u202Eevil\u202C"), "evil");
     assert.equal(sanitizeNote("   "), "");
   });
