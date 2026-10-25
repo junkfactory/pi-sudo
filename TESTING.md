@@ -62,6 +62,11 @@ Two findings worth keeping:
 
 - One intermittent double prompt appeared after a deliberate three-failure test. The most likely cause is `pam_faillock` refusing the login immediately after the lockout, not a pi-sudo defect: every cold run since has been clean. If it recurs, check `faillock --user "$USER"` before blaming the dialog.
 - Item 4 and item 5 exercise the same denial path. A broken focus or key-gating layer shows up there first, as a dialog that denies every approval.
+- The model-visible output includes sudo's own prompt line, for example `[pi-sudo:<hex>] password:`. It is public by design and carries no secret; do not report it as a leak.
+
+### Re-run after the security fixes
+
+Rows 5 and 10 were re-run against commit `041202c`, which replaced the root-side stderr redirection with `exec 2>&1` and made the command preview show every byte. Both passed: the escalation gate appeared before anything else, a `No` plus note denial reached the model as `The user added: …` with `attempts: 0` and nothing ran, an approval ran as root and cleaned up after itself, and a cold run with a real nonce prompt left the `cat` child at EOF with no secret in the output.
 
 ## Resetting state between runs
 
