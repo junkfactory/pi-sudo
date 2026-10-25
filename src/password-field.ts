@@ -1,7 +1,8 @@
 import { CURSOR_MARKER, renderFakeCursor, truncateToWidth } from "@earendil-works/pi-tui";
 import type { Component, Focusable } from "@earendil-works/pi-tui";
 
-const PROMPT = "Password: ";
+export const PASSWORD_PROMPT = "Password: ";
+const PROMPT = PASSWORD_PROMPT;
 const BULLET = "•";
 const ELLIPSIS = "…";
 const PASTE_START = "\x1b[200~";
@@ -165,12 +166,12 @@ export class PasswordField implements Component, Focusable {
     // Nothing cached.
   }
 
-  render(width: number): string[] {
+  render(width: number, prompt: string = PROMPT): string[] {
     const n = codePoints(this.#bytes);
     const room = Math.max(1, width - PROMPT.length - 2);
     const bullets = BULLET.repeat(Math.min(n, room)) + (n > room ? ELLIPSIS : "");
     const cursor = this.#focused ? CURSOR_MARKER + renderFakeCursor(" ") : "";
-    return [truncateToWidth(`${PROMPT}${bullets}${cursor}`, width)];
+    return [truncateToWidth(`${prompt}${bullets}${cursor}`, width)];
   }
 
   /** Bytes typed so far, cut at the first CR/LF. The field is zeroed either way. */

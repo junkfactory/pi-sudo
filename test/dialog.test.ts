@@ -1,34 +1,44 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
   createApprovalDialog,
   createEscalationDialog,
   sanitizeForDisplay,
   sanitizeNote,
   type ApprovalDialog,
+  type ApprovalOutcome,
   type DialogTheme,
   type EscalationAnswer,
 } from "../src/dialog.js";
 
 const WIDTH = 60;
+const CURSOR = "\u001b_pi:c";
 
 const plainTheme: DialogTheme = {
   fg: (_color, text) => text,
 };
 
+/** pi-tui hides its fake cursor in ESC _pi:…BEL markers inside the text. */
+const plain = (line: string): string => line.replace(/\u001b_pi:[^\u0007]*\u0007/g, "");
+
 interface Harness {
   dialog: ApprovalDialog;
   settled: () => boolean;
-  result: () => Buffer | undefined;
+  result: () => ApprovalOutcome | undefined;
 }
 
-function harness(command: string, reason = "free disk space", errorText?: string): Harness {
+function harness(
+  command: string,
+  reason = "free disk space",
+  options: { warm?: boolean } = {},
+): Harness {
   let settled = false;
-  let result: Buffer | undefined;
+  let result: ApprovalOutcome | undefined;
   const dialog = createApprovalDialog({
     command,
     reason,
-    errorText,
+    warm: options.warm ?? false,
     theme: plainTheme,
     done: (value) => {
       settled = true;
@@ -39,8 +49,15 @@ function harness(command: string, reason = "free disk space", errorText?: string
 }
 
 const PAGE_DOWN = "\x1b[6~";
+const PAGE_UP = "\x1b[5~";
 const ENTER = "\r";
 const ESC = "\x1b";
+const UP = "\x1b[A";
+const DOWN = "\x1b[B";
+const SHIFT_UP = "\x1b[1;2A";
+const SHIFT_DOWN = "\x1b[1;2B";
+const HOME = "\x1b[H";
+const END = "\x1b[4~";
 
 describe("sanitizeForDisplay", () => {
   it("renders escape sequences instead of hiding the text inside them", () => {
@@ -94,9 +111,12 @@ describe("ApprovalDialog", () => {
   it("renders the escaped and bidi-laden command without reordering it", () => {
     const command = "echo \x1b[2Jsafe \u202Ereversed\u202C tail";
     const { dialog } = harness(command);
-    const rendered = dialog.render(WIDTH).join("\n");
+    const rendered = plain(dialog.render(WIDTH).join("\n"));
 
-    assert.ok(!rendered.includes("\x1b"), rendered);
+    // truncateToWidth adds its own SGR resets; after removing those no escape
+    // byte from the command may survive.
+    const withoutSgr = rendered.replace(/\u001b\[[0-9;]*m/g, "");
+    assert.ok(!withoutSgr.includes("\x1b"), withoutSgr);
     assert.ok(!/[\u202a-\u202e\u200b-\u200f\u2066-\u2069]/u.test(rendered), rendered);
     assert.ok(rendered.includes("echo <U+001B>[2Jsafe "), rendered);
     assert.ok(rendered.includes("U+202E"));
@@ -104,11 +124,112 @@ describe("ApprovalDialog", () => {
     assert.ok(rendered.indexOf("reversed") < rendered.indexOf("tail"));
   });
 
-  it("cannot approve an overflowing command until it is scrolled to the end", () => {
+  it("draws a bordered frame titled with the request title at a fixed width", () => {
+    const { dialog } = harness("id");
+    const lines = dialog.render(WIDTH).map(plain);
+    assert.ok(lines[0].includes("\u03c0 sudo: Requesting root privilege"), lines[0]);
+    assert.ok(lines[0].startsWith("\u256d\u2500"), lines[0]);
+    // The dash run must reach the corner: a space there reads as a broken line.
+    assert.ok(lines[0].endsWith("\u2500\u256e"), JSON.stringify(lines[0]));
+    assert.ok(lines[lines.length - 1].startsWith("\u2570"), lines[lines.length - 1]);
+    for (const line of lines) {
+      assert.equal(visibleWidth(line), WIDTH, JSON.stringify(line));
+    }
+  });
+
+  it("selects Yes, once by default", () => {
+    const lines = harness("id").dialog.render(WIDTH).map(plain);
+    assert.ok(lines.some((line) => line.includes("\u2192 Yes, once")), lines.join("\n"));
+    assert.equal(lines.some((line) => line.includes("\u2192 No")), false);
+  });
+
+  it("moves the selection with up and down and clamps at both ends", () => {
+    const h = harness("id");
+    const selected = (): string =>
+      h.dialog
+        .render(WIDTH)
+        .map(plain)
+        .find((line) => line.includes("\u2192")) ?? "";
+    assert.ok(selected().includes("\u2192 Yes, once"), selected());
+    h.dialog.handleInput(UP);
+    assert.ok(selected().includes("\u2192 Yes, once"), "up at the top stays on the first option");
+    h.dialog.handleInput(DOWN);
+    assert.ok(selected().includes("\u2192 Yes, until sudo asks again"), selected());
+    h.dialog.handleInput(DOWN);
+    assert.ok(selected().includes("\u2192 No"), selected());
+    h.dialog.handleInput(DOWN);
+    assert.ok(selected().includes("\u2192 No"), "down at the bottom stays on No");
+    h.dialog.handleInput(UP);
+    assert.ok(selected().includes("\u2192 Yes, until sudo asks again"), selected());
+    h.dialog.handleInput(UP);
+    assert.ok(selected().includes("\u2192 Yes, once"), selected());
+  });
+
+  it("scrolls the preview with shift+up/down, PgUp/PgDn, and Home without moving the selection", () => {
     const command = `echo ${"needle ".repeat(200)}`;
     const h = harness(command);
-    h.dialog.render(WIDTH);
+    const view = (): string[] => h.dialog.render(WIDTH).map(plain);
+    const header = (): string => view().find((line) => line.includes("Command")) ?? "";
+    const arrow = (): string => view().find((line) => line.includes("\u2192")) ?? "";
+
+    const first = header();
+    assert.match(first, /lines 1-/);
+    h.dialog.handleInput(SHIFT_DOWN);
+    assert.notEqual(header(), first);
+    assert.match(header(), /lines 11-/);
+
+    const afterShiftDown = header();
+    h.dialog.handleInput(PAGE_DOWN);
+    assert.notEqual(header(), afterShiftDown);
+
+    const afterPageDown = header();
+    h.dialog.handleInput(SHIFT_UP);
+    assert.notEqual(header(), afterPageDown);
+
+    const afterShiftUp = header();
+    h.dialog.handleInput(PAGE_UP);
+    assert.notEqual(header(), afterShiftUp);
+
+    h.dialog.handleInput(HOME);
+    assert.equal(header(), first);
+    // The options only appear at the end, and the selection never moved.
+    h.dialog.handleInput(END);
+    assert.ok(arrow().includes("Yes, once"), "scrolling must not move the selection");
+  });
+
+  it("keeps Enter inert until the preview reaches its end", () => {
+    const command = `echo ${"needle ".repeat(200)}`;
+    const h = harness(command);
+    const rendered = h.dialog.render(WIDTH).map(plain).join("\n");
     assert.equal(h.dialog.sawEnd, false);
+    // The footer carries the requirement, and the options are not on screen yet.
+    assert.ok(
+      rendered.includes("You must read the full command to make a decision:"),
+      rendered,
+    );
+    assert.equal(rendered.includes("Yes, once"), false, "options stay hidden until the end");
+    // The frame keeps the same shape while the gate is closed: the divider sits
+    // under the preview, then a blank row, the hint, blank rows where the options
+    // and the password row will be, and the navigation footer.
+    const lines = h.dialog.render(WIDTH).map(plain);
+    const dividerAt = lines.findIndex((line) => line.startsWith("├"));
+    const readAt = lines.findIndex((line) => line.includes("You must read the full command"));
+    const keysAt = lines.findIndex((line) => line.includes("shift+↑↓ scroll"));
+    assert.equal(dividerAt, readAt - 2, "the divider and a blank row sit above the hint");
+    assert.equal(lines[readAt].startsWith("│   You must read"), true, "hint aligns with the option labels");
+    // The whole sentence survives a narrow terminal instead of being truncated.
+    assert.ok(
+      lines.slice(readAt, readAt + 3).join(" ").includes("scroll to the bottom"),
+      "the hint must ask for a scroll to the bottom",
+    );
+    assert.equal(keysAt, readAt + 4, "two blank rows and the password slot sit above the footer");
+    assert.equal(lines[keysAt + 1].startsWith("╰"), true);
+    // Opening the gate must not resize the frame, on its own dialog so the scroll
+    // position of this one stays where the assertions below expect it.
+    const growth = harness(command);
+    const gatedHeight = growth.dialog.render(WIDTH).length;
+    growth.dialog.handleInput(END);
+    assert.equal(growth.dialog.render(WIDTH).length, gatedHeight, "no growth when the options appear");
 
     h.dialog.handleInput("hunter2");
     h.dialog.handleInput(ENTER);
@@ -120,34 +241,183 @@ describe("ApprovalDialog", () => {
     h.dialog.handleInput(ENTER);
     assert.equal(h.settled(), false);
 
-    // Page down until the preview reaches its last line.
-    for (let i = 0; i < 10 && !h.dialog.sawEnd; i += 1) {
-      h.dialog.handleInput(PAGE_DOWN);
-      h.dialog.render(WIDTH);
-    }
+    h.dialog.handleInput(END);
+    h.dialog.render(WIDTH);
     assert.equal(h.dialog.sawEnd, true);
-
     h.dialog.handleInput(ENTER);
     assert.equal(h.settled(), true);
-    assert.deepEqual(h.result(), Buffer.from("hunter2", "utf8"));
+    assert.deepEqual(h.result(), {
+      approved: true,
+      mode: "once",
+      password: Buffer.from("hunter2"),
+    });
   });
 
-  it("resolves undefined on an empty submit", () => {
-    const h = harness("id");
+  it("re-arms the scroll gate after Home returns to the start", () => {
+    const command = `echo ${"needle ".repeat(200)}`;
+    const h = harness(command);
     h.dialog.render(WIDTH);
+    h.dialog.handleInput("hunter2");
+    h.dialog.handleInput(END);
+    h.dialog.render(WIDTH);
+    assert.equal(h.dialog.sawEnd, true);
+    h.dialog.handleInput(HOME);
+    h.dialog.render(WIDTH);
+    assert.equal(h.dialog.sawEnd, false);
+    h.dialog.handleInput(ENTER);
+    assert.equal(h.settled(), false);
+  });
+
+  it("starts with the password field focused, so typing fills it", () => {
+    const h = harness("id");
+    h.dialog.focused = true;
+    assert.equal(h.dialog.field.focused, true);
+    // The cursor marker proves the field, not the choice row, owns the keystrokes.
+    assert.ok(plain(h.dialog.render(WIDTH).join("\n")).includes("Password:"));
+    h.dialog.handleInput("hunter2");
+    assert.equal(h.dialog.field.take().toString(), "hunter2");
+  });
+
+  it("approves once with the typed password on Enter", () => {
+    const h = harness("id");
+    h.dialog.focused = true;
+    h.dialog.handleInput("hunter2");
     h.dialog.handleInput(ENTER);
     assert.equal(h.settled(), true);
-    assert.equal(h.result(), undefined);
+    assert.deepEqual(h.result(), {
+      approved: true,
+      mode: "once",
+      password: Buffer.from("hunter2"),
+    });
   });
 
-  it("resolves undefined on Esc and zeroes the typed bytes", () => {
+  it("approves the ticket-wide option once down selects it", () => {
+    const h = harness("id");
+    h.dialog.handleInput("hunter2");
+    h.dialog.handleInput(DOWN);
+    h.dialog.handleInput(ENTER);
+    assert.deepEqual(h.result(), {
+      approved: true,
+      mode: "ticket",
+      password: Buffer.from("hunter2"),
+    });
+  });
+
+  it("routes typing to the reason field while No is selected", () => {
     const h = harness("id");
     h.dialog.render(WIDTH);
-    h.dialog.field.handleInput("secret");
+    h.dialog.handleInput(DOWN);
+    h.dialog.handleInput(DOWN);
+    h.dialog.handleInput("needs an audit trail");
+    const noLine = h.dialog
+      .render(WIDTH)
+      .map(plain)
+      .find((line) => line.includes("\u2192 No"));
+    assert.ok(noLine?.includes("[ needs an audit trail"), noLine);
+    h.dialog.handleInput(ENTER);
+    assert.deepEqual(h.result(), { approved: false, note: "needs an audit trail" });
+  });
+
+  it("shows the denial placeholder on the selected No row", () => {
+    const h = harness("id");
+    h.dialog.render(WIDTH);
+    h.dialog.handleInput(DOWN);
+    h.dialog.handleInput(DOWN);
+    const lines = h.dialog.render(WIDTH).map(plain);
+    const noLine = lines.find((line) => line.includes("\u2192 No"));
+    assert.ok(noLine?.includes("enter reason for denial (optional)"), noLine);
+    for (const line of lines) {
+      assert.equal(visibleWidth(line), WIDTH, JSON.stringify(line));
+    }
+  });
+
+  it("sanitizes the typed reason to one line and caps it", () => {
+    const h = harness("id");
+    h.dialog.render(WIDTH);
+    h.dialog.handleInput(DOWN);
+    h.dialog.handleInput(DOWN);
+    h.dialog.handleInput("line one\u202Eline two");
+    h.dialog.handleInput(ENTER);
+    assert.deepEqual(h.result(), { approved: false, note: "line one line two" });
+
+    const capped = harness("id");
+    capped.dialog.render(WIDTH);
+    capped.dialog.handleInput(DOWN);
+    capped.dialog.handleInput(DOWN);
+    capped.dialog.handleInput("x".repeat(600));
+    capped.dialog.handleInput(ENTER);
+    const outcome = capped.result();
+    assert.ok(outcome !== undefined && !outcome.approved, "expected a denial");
+    assert.equal(outcome.note.length, 500);
+    assert.equal(outcome.note, "x".repeat(500));
+  });
+
+  it("keeps the typed password when switching to No and back to Yes", () => {
+    const h = harness("id");
+    h.dialog.render(WIDTH);
+    h.dialog.handleInput("hunter2");
+    h.dialog.handleInput(DOWN);
+    h.dialog.handleInput(DOWN);
+    h.dialog.handleInput("not now");
+    h.dialog.handleInput(UP);
+    h.dialog.handleInput(UP);
+    const passwordRow = h.dialog
+      .render(WIDTH)
+      .map(plain)
+      .find((line) => line.includes("Password:"));
+    assert.ok(passwordRow?.includes("\u2022".repeat(7)), passwordRow);
+    assert.equal(passwordRow?.includes("not now"), false, passwordRow);
+    h.dialog.handleInput(ENTER);
+    assert.deepEqual(h.result(), {
+      approved: true,
+      mode: "once",
+      password: Buffer.from("hunter2"),
+    });
+  });
+
+  it("keeps the dialog open with a red prompt when Enter has no password", () => {
+    // A slip of the finger must not deny the request: the prompt answers instead.
+    const marked: DialogTheme = {
+      fg: (color, text) => (color === "error" ? `[E]${text}` : text),
+    };
+    let result: ApprovalOutcome | undefined;
+    const dialog = createApprovalDialog({
+      command: "id",
+      reason: "root",
+      warm: false,
+      theme: marked,
+      done: (value) => {
+        result = value;
+      },
+    });
+    const text = (): string => dialog.render(WIDTH).map(plain).join("\n");
+    dialog.render(WIDTH);
+    dialog.handleInput(ENTER);
+    assert.equal(result, undefined, "an empty password must not deny");
+    assert.ok(text().includes("[E]Password: "), "the prompt turns red");
+    dialog.handleInput("h");
+    assert.equal(text().includes("[E]Password: "), false, "the alert clears on the next key");
+    dialog.handleInput(ESC);
+    assert.deepEqual(result, { approved: false, note: "" });
+  });
+
+  it("declines on Esc with an empty note and clears both fields", () => {
+    const h = harness("id");
+    h.dialog.render(WIDTH);
+    h.dialog.handleInput("hunter2");
+    h.dialog.handleInput(DOWN);
+    h.dialog.handleInput(DOWN);
+    h.dialog.handleInput("half typed reason");
     h.dialog.handleInput(ESC);
     assert.equal(h.settled(), true);
-    assert.equal(h.result(), undefined);
+    assert.deepEqual(h.result(), { approved: false, note: "" });
     assert.deepEqual(h.dialog.field.take(), Buffer.alloc(0));
+    const noLine = h.dialog
+      .render(WIDTH)
+      .map(plain)
+      .find((line) => line.includes("\u2192 No"));
+    assert.ok(noLine?.includes("enter reason for denial (optional)"), noLine);
+    assert.equal(noLine?.includes("half typed reason"), false, noLine);
   });
 
   it("renders the model's reason on one line", () => {
@@ -165,13 +435,54 @@ describe("ApprovalDialog", () => {
     assert.ok(!lines.some((line) => line.trim() === "second line"));
   });
 
-  it("propagates focus to the password field", () => {
+  it("starts focused and propagates focus to the password field", () => {
     const h = harness("id");
-    assert.equal(h.dialog.focused, false);
-    h.dialog.focused = true;
+    assert.equal(h.dialog.focused, true);
     assert.equal(h.dialog.field.focused, true);
     h.dialog.focused = false;
     assert.equal(h.dialog.field.focused, false);
+    h.dialog.focused = true;
+    assert.equal(h.dialog.field.focused, true);
+  });
+});
+
+describe("ApprovalDialog (warm ticket)", () => {
+  it("renders no password prompt and no masked field", () => {
+    const h = harness("id", "free disk space", { warm: true });
+    const rendered = plain(h.dialog.render(WIDTH).join("\n"));
+    assert.equal(rendered.includes("Password:"), false, rendered);
+    assert.equal(rendered.includes("\u2022"), false, rendered);
+    assert.ok(rendered.includes("Yes, once"), rendered);
+    assert.ok(rendered.includes("Yes, until sudo asks again"), rendered);
+  });
+
+  it("approves once with a zero-length password without typing", () => {
+    const h = harness("id", "free disk space", { warm: true });
+    h.dialog.handleInput(ENTER);
+    assert.equal(h.settled(), true);
+    assert.deepEqual(h.result(), {
+      approved: true,
+      mode: "once",
+      password: Buffer.alloc(0),
+    });
+  });
+
+  it("approves the ticket-wide option after down", () => {
+    const h = harness("id", "free disk space", { warm: true });
+    h.dialog.handleInput(DOWN);
+    h.dialog.handleInput(ENTER);
+    assert.deepEqual(h.result(), {
+      approved: true,
+      mode: "ticket",
+      password: Buffer.alloc(0),
+    });
+  });
+
+  it("denies on Esc with an empty note", () => {
+    const h = harness("id", "free disk space", { warm: true });
+    h.dialog.handleInput(ESC);
+    assert.equal(h.settled(), true);
+    assert.deepEqual(h.result(), { approved: false, note: "" });
   });
 });
 
@@ -179,9 +490,6 @@ describe("EscalationDialog", () => {
   const redTheme: DialogTheme = {
     fg: (color, text) => (color === "error" ? `\u001b[31m${text}\u001b[39m` : text),
   };
-  const CURSOR = "\u001b_pi:c";
-  /** pi-tui hides its fake cursor in ESC _pi:…BEL markers inside the text. */
-  const plain = (line: string): string => line.replace(/\u001b_pi:[^\u0007]*\u0007/g, "");
 
   function escalation(theme: DialogTheme = plainTheme): {
     dialog: ReturnType<typeof createEscalationDialog>;

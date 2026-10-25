@@ -12,6 +12,7 @@ import type {
 import { askApproval, askEscalationConfirm } from "./dialog.js";
 import {
   forgetTicket,
+  probeTicket,
   runCold,
   runWarm,
   sweepStaleTemp,
@@ -107,6 +108,8 @@ export interface SudoExecDetails {
   durationMs: number;
   attempts: number;
   warm: boolean;
+  /** Which approval the user gave. Absent when nothing ran. */
+  approval?: "once" | "ticket";
   policyChecked: boolean;
 }
 
@@ -215,6 +218,7 @@ function execResult(
   result: ExecResult,
   attempts: number,
   policyChecked: boolean,
+  approval: "once" | "ticket",
 ): AgentToolResult<SudoExecDetails> {
   const exit = result.exitCode === null ? "none (killed)" : String(result.exitCode);
   const header = `$ ${result.command}\nexit code: ${exit}`;
@@ -230,6 +234,7 @@ function execResult(
       durationMs: result.durationMs,
       attempts,
       warm: result.warm,
+      approval,
       policyChecked,
     },
     isError: !result.ok,
@@ -327,13 +332,24 @@ export function setPermissionServiceFn(
 
 export default function (pi: ExtensionAPI) {
   let cachedSessionId: string | undefined;
+  // Scope of a "until sudo asks again" approval. In memory only, never
+  // persisted: cleared by a failed warm run, /sudo-forget, and new/resume/fork.
+  let ticketGranted = false;
 
   pi.events.on("permissions:ready", (data) => {
     const id = (data as { sessionId?: unknown }).sessionId;
     if (typeof id === "string" && id.length > 0) cachedSessionId = id;
   });
 
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (event) => {
+    // The approval is session-scoped, so a new, resumed, or forked session starts
+    // without one. sudo -k is what makes it cold: pi's sudo runs have no terminal,
+    // so sudo keys their record on pi's pid, and a session switch keeps that pid.
+    // The user's own terminal keeps its own, separate ticket.
+    if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
+      ticketGranted = false;
+      await forgetTicket(spawnImpl).catch(() => {});
+    }
     await sweepStaleTemp().catch(() => {});
   });
 
@@ -349,6 +365,7 @@ export default function (pi: ExtensionAPI) {
       "Clear sudo's cached ticket (runs sudo -k) so the next sudo_exec prompts again",
     handler: async (_args, ctx) => {
       try {
+        ticketGranted = false;
         const outcome = await forgetTicket(spawnImpl);
         if (outcome.ok) {
           ctx.ui.notify("sudo ticket cleared; the next sudo_exec will prompt.", "info");
@@ -477,41 +494,75 @@ export default function (pi: ExtensionAPI) {
           }
         }
 
-        const warm = await runWarm({
-          command,
-          cwd: ctx.cwd,
-          timeoutSec,
-          signal,
-          spawnFn: spawnImpl,
-          onOutput: streamOutput,
-        });
-        if ("ran" in warm) {
-          return execResult(warm.result, 0, policyChecked);
+        let warm = false;
+        if (ticketGranted) {
+          const silent = await runWarm({
+            command,
+            cwd: ctx.cwd,
+            timeoutSec,
+            signal,
+            spawnFn: spawnImpl,
+            onOutput: streamOutput,
+          });
+          if ("ran" in silent) {
+            return execResult(silent.result, 0, policyChecked, "ticket");
+          }
+          ticketGranted = false; // sudo wants a password again
+        } else {
+          warm = await probeTicket({
+            cwd: ctx.cwd,
+            timeoutSec,
+            signal,
+            spawnFn: spawnImpl,
+          });
         }
 
         let attempts = 0;
         let lastError: string | undefined;
         while (attempts < MAX_ATTEMPTS) {
-          const password = await askApproval(ctx, command, reason, lastError);
-          if (password === undefined) {
+          const answer = await askApproval(ctx, command, reason, {
+            warm,
+            errorText: lastError,
+          });
+          if (!answer.approved) {
+            const suffix =
+              answer.note.length > 0 ? `\n\nThe user added: ${answer.note}` : "";
             return textResult(
-              DENIAL_TEXT,
+              `${DENIAL_TEXT}${suffix}`,
               true,
               details({ attempts, policyChecked }),
             );
+          }
+          // Assigned, not OR-ed: a re-prompt after a lost race must honour the
+          // latest answer, never a scope the user has just declined.
+          ticketGranted = answer.mode === "ticket";
+          if (warm) {
+            const silent = await runWarm({
+              command,
+              cwd: ctx.cwd,
+              timeoutSec,
+              signal,
+              spawnFn: spawnImpl,
+              onOutput: streamOutput,
+            });
+            if ("ran" in silent) {
+              return execResult(silent.result, 0, policyChecked, answer.mode);
+            }
+            warm = false; // raced: the ticket expired between probe and run
+            continue;
           }
           attempts += 1;
           const outcome = await runCold({
             command,
             cwd: ctx.cwd,
-            password,
+            password: answer.password,
             timeoutSec,
             signal,
             spawnFn: spawnImpl,
             onOutput: streamOutput,
           });
           if (outcome.status === "ran") {
-            return execResult(outcome.result, attempts, policyChecked);
+            return execResult(outcome.result, attempts, policyChecked, answer.mode);
           }
           lastError = firstStderrLine(outcome.result.sudoStderr);
         }

@@ -109,11 +109,23 @@ export function resolveSudo(): string {
   return fixed;
 }
 
-/** The warm probe runs the real command; only password-required prompts defer to the dialog. */
+/** Run a command without a password. Returns `needsPassword` when sudo wants one. */
 export async function runWarm(options: SpawnRunOptions): Promise<WarmOutcome> {
   const outcome = await runOnce(options, undefined);
   if (outcome.needsPassword) return { needsPassword: true };
   return { ran: true, result: outcome.result };
+}
+
+/**
+ * Learn whether sudo will prompt without running the user's command. `true`
+ * as root prints nothing and only refreshes sudo's own timestamp, which is
+ * sudo's business. Returns true when sudo would run without a password.
+ */
+export async function probeTicket(
+  options: Omit<SpawnRunOptions, "command">,
+): Promise<boolean> {
+  const outcome = await runWarm({ ...options, command: "true" });
+  return "ran" in outcome;
 }
 
 /** The authenticated run. Returns `retry` only for sudo's "Sorry, try again." line. */

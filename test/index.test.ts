@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
-import { describe, it } from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { after, describe, it } from "node:test";
 import type {
   ExtensionAPI,
   ExtensionToolContext,
@@ -17,6 +18,20 @@ import extension, {
   type SudoExecDetails,
 } from "../src/index.js";
 import type { SpawnFn } from "../src/executor.js";
+import type { ApprovalOutcome } from "../src/dialog.js";
+
+const DENIAL_TEXT =
+  "The user denied this sudo request; nothing ran. Do not retry the same command. Explain to the user why root was needed and propose a safer non-privileged alternative if one exists.";
+const DENY: ApprovalOutcome = { approved: false, note: "" };
+
+// session_start sweeps pi-sudo-* directories under tmpdir(). Other test files
+// run in parallel against the shared tmpdir, so give this file a private root.
+const PRIVATE_TMP = mkdtempSync(join(tmpdir(), "index-suite-pi-sudo-"));
+process.env.TMPDIR = PRIVATE_TMP;
+
+after(() => {
+  rmSync(PRIVATE_TMP, { recursive: true, force: true });
+});
 
 class FakeStdin extends EventEmitter {
   readonly writes: Array<Buffer | string> = [];
@@ -136,18 +151,19 @@ function makeCtx(options: {
   mode?: "tui" | "rpc" | "json" | "print";
   hasUI?: boolean;
   cwd?: string;
-  passwords?: Array<Buffer | undefined>;
+  /** Answers `ctx.ui.custom` returns in order, standing in for the approval dialog. */
+  answers?: ApprovalOutcome[];
   /** Stands in for `ctx.ui.custom`, e.g. to answer the escalation dialog. */
   onCustom?: () => Promise<unknown>;
 } = {}): { ctx: ExtensionToolContext; calls: CtxCalls } {
   const calls: CtxCalls = { custom: 0, confirm: 0, notify: [] };
-  const passwords = options.passwords ?? [];
-  let passwordIndex = 0;
+  const answers = options.answers ?? [];
+  let answerIndex = 0;
   const ui = {
     custom: async () => {
       calls.custom += 1;
       if (options.onCustom !== undefined) return options.onCustom();
-      return passwords[passwordIndex++];
+      return answers[answerIndex++];
     },
     confirm: async () => {
       calls.confirm += 1;
@@ -187,6 +203,16 @@ function nonceFrom(args: string[]): string {
   assert.ok(nonce !== undefined, "expected a -p nonce in the sudo argv");
   return nonce;
 }
+
+function payloadFrom(args: string[]): string {
+  return args[args.length - 1];
+}
+
+function once(password: string): ApprovalOutcome {
+  return { approved: true, mode: "once", password: Buffer.from(password) };
+}
+
+const TICKET: ApprovalOutcome = { approved: true, mode: "ticket", password: Buffer.alloc(0) };
 
 async function waitFor(predicate: () => boolean): Promise<void> {
   for (let i = 0; i < 400; i += 1) {
@@ -455,12 +481,13 @@ describe("sudo_exec retry policy", () => {
       const tool = harness.tools.get("sudo_exec");
       assert.ok(tool !== undefined);
       const { ctx, calls } = makeCtx({
-        passwords: [Buffer.from("one"), Buffer.from("two")],
+        answers: [once("one"), once("two")],
       });
       const result = await executeTool(tool, ctx, "systemctl restart nginx");
       assert.equal(result.isError, false);
       assert.equal(result.details.attempts, 2);
       assert.equal(result.details.warm, false);
+      assert.equal(result.details.approval, "once");
       assert.equal(calls.custom, 2);
       assert.equal(records.length, 3);
       assert.match(textOf(result), /^\$ systemctl restart nginx\n/);
@@ -491,12 +518,353 @@ describe("sudo_exec retry policy", () => {
       const harness = makeHarness();
       const tool = harness.tools.get("sudo_exec");
       assert.ok(tool !== undefined);
-      const { ctx, calls } = makeCtx({ passwords: [Buffer.from("one")] });
+      const { ctx, calls } = makeCtx({ answers: [once("one")] });
       const result = await executeTool(tool, ctx, "id");
       assert.equal(result.isError, true);
       assert.equal(result.details.attempts, 1);
       assert.equal(calls.custom, 1);
       assert.equal(records.length, 2);
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+});
+
+describe("sudo_exec approval lifetime", () => {
+  it("asks again on a warm ticket when the previous answer was once", async () => {
+    const { records, spawnFn } = makeSpawn((child) => {
+      setTimeout(() => child.emit("close", 0, null), 0);
+    });
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx, calls } = makeCtx({ answers: [once("hunter2"), once("hunter2")] });
+
+      const first = await executeTool(tool, ctx, "systemctl restart nginx");
+      const second = await executeTool(tool, ctx, "systemctl restart nginx");
+
+      assert.equal(first.isError, false);
+      assert.equal(first.details.approval, "once");
+      assert.equal(second.details.approval, "once");
+      assert.equal(calls.custom, 2, "a once approval must not suppress the next dialog");
+      assert.deepEqual(
+        records.map((record) => payloadFrom(record.args)),
+        [
+          "exec 2>&1; true",
+          "exec 2>&1; systemctl restart nginx",
+          "exec 2>&1; true",
+          "exec 2>&1; systemctl restart nginx",
+        ],
+      );
+      assert.equal(
+        records.every((record) => record.args[0] === "-n"),
+        true,
+        "every spawn was passwordless",
+      );
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+
+  it("runs the next call silently under a ticket-wide approval", async () => {
+    const { records, spawnFn } = makeSpawn((child) => {
+      setTimeout(() => child.emit("close", 0, null), 0);
+    });
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx, calls } = makeCtx({ answers: [TICKET] });
+
+      const first = await executeTool(tool, ctx, "systemctl restart nginx");
+      const second = await executeTool(tool, ctx, "systemctl restart nginx");
+
+      assert.equal(first.details.approval, "ticket");
+      assert.equal(calls.custom, 1, "a ticket approval suppresses the next dialog");
+      assert.equal(second.details.approval, "ticket");
+      assert.equal(second.details.attempts, 0);
+      assert.equal(second.details.warm, true);
+      assert.equal(records.length, 3, "one probe, one approved run, one silent run");
+      assert.equal(records[2].args[0], "-n");
+      assert.equal(payloadFrom(records[2].args), "exec 2>&1; systemctl restart nginx");
+      assert.equal(
+        records.some((record) => record.args.includes("-k")),
+        false,
+        "a ticket run must not forget the ticket",
+      );
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+
+  it("clears the ticket when the silent run needs a password, then dialogs", async () => {
+    const { records, spawnFn } = makeSpawn((child, args, index) => {
+      setTimeout(() => {
+        if (index === 2) {
+          child.stderr.emit("data", Buffer.from("sudo: a password is required\n"));
+          child.emit("close", 1, null);
+          return;
+        }
+        if (index === 3) {
+          child.stderr.emit("data", Buffer.from(nonceFrom(args)));
+          child.emit("close", 0, null);
+          return;
+        }
+        child.emit("close", 0, null);
+      }, 0);
+    });
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx, calls } = makeCtx({ answers: [TICKET, once("hunter2")] });
+
+      const first = await executeTool(tool, ctx, "systemctl restart nginx");
+      // The hidden run discovers sudo now wants a password: the grant is gone.
+      const second = await executeTool(tool, ctx, "systemctl restart nginx");
+
+      assert.equal(first.details.approval, "ticket");
+      assert.equal(second.details.approval, "once");
+      assert.equal(second.details.attempts, 1);
+      assert.equal(second.details.warm, false);
+      assert.equal(calls.custom, 2, "the cleared grant must open a dialog");
+      assert.equal(records.length, 4);
+      assert.equal(records[2].args[0], "-n");
+      assert.equal(records[3].args[0], "-S");
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+
+  it("denies with the standard text and never runs the command as root", async () => {
+    const { records, spawnFn } = makeSpawn((child) => {
+      setTimeout(() => {
+        child.stderr.emit("data", Buffer.from("sudo: a password is required\n"));
+        child.emit("close", 1, null);
+      }, 0);
+    });
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx, calls } = makeCtx({ answers: [DENY] });
+
+      const result = await executeTool(tool, ctx, "systemctl restart nginx");
+
+      assert.equal(result.isError, true);
+      assert.match(
+        textOf(result),
+        /^The user denied this sudo request; nothing ran\. Do not retry the same command\./,
+      );
+      assert.equal(result.details.approval, undefined);
+      assert.equal(calls.custom, 1);
+      assert.equal(records.length, 1, "only the true probe may spawn");
+      assert.equal(records[0].args[0], "-n");
+      assert.equal(payloadFrom(records[0].args), "exec 2>&1; true");
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+
+  it("carries a declined request's reason into the result text once", async () => {
+    const { records, spawnFn } = makeSpawn((child) => {
+      setTimeout(() => {
+        child.stderr.emit("data", Buffer.from("sudo: a password is required\n"));
+        child.emit("close", 1, null);
+      }, 0);
+    });
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const note = "run it during the maintenance window";
+      const { ctx, calls } = makeCtx({ answers: [{ approved: false, note }] });
+
+      const result = await executeTool(tool, ctx, "systemctl restart nginx");
+
+      assert.equal(result.isError, true);
+      assert.equal(result.details.attempts, 0);
+      assert.equal(result.details.approval, undefined);
+      assert.equal(textOf(result), `${DENIAL_TEXT}\n\nThe user added: ${note}`);
+      assert.equal(
+        textOf(result).split("The user added:").length - 1,
+        1,
+        "the note is appended exactly once",
+      );
+      assert.equal(calls.custom, 1);
+      assert.equal(records.length, 1, "only the warm probe may spawn");
+      assert.equal(payloadFrom(records[0].args), "exec 2>&1; true");
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+
+  it("adds no note suffix to a silent denial", async () => {
+    const { spawnFn } = makeSpawn((child) => {
+      setTimeout(() => {
+        child.stderr.emit("data", Buffer.from("sudo: a password is required\n"));
+        child.emit("close", 1, null);
+      }, 0);
+    });
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx } = makeCtx({ answers: [DENY] });
+
+      const result = await executeTool(tool, ctx, "id");
+
+      assert.equal(result.isError, true);
+      assert.equal(result.details.attempts, 0);
+      assert.equal(textOf(result), DENIAL_TEXT);
+      assert.equal(textOf(result).includes("The user added:"), false);
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+
+  it("reports approval once for a cold authenticated run", async () => {
+    const { records, spawnFn } = makeSpawn((child, args, index) => {
+      setTimeout(() => {
+        if (index === 0) {
+          child.stderr.emit("data", Buffer.from("sudo: a password is required\n"));
+          child.emit("close", 1, null);
+          return;
+        }
+        child.stderr.emit("data", Buffer.from(nonceFrom(args)));
+        child.emit("close", 0, null);
+      }, 0);
+    });
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const secret = "Zq9-once-secret";
+      const { ctx, calls } = makeCtx({ answers: [once(secret)] });
+
+      const result = await executeTool(tool, ctx, "id");
+
+      assert.equal(result.isError, false);
+      assert.equal(result.details.approval, "once");
+      assert.equal(result.details.attempts, 1);
+      assert.equal(result.details.warm, false);
+      assert.equal(calls.custom, 1);
+      assert.equal(records.length, 2);
+      assert.equal(records[1].args[0], "-S");
+      assert.equal(textOf(result).includes(secret), false);
+      assert.equal(JSON.stringify(result.details).includes(secret), false);
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+});
+
+describe("ticket reset", () => {
+  function startSession(harness: Harness, reason: string): Promise<unknown> {
+    const handler = harness.handlers.get("session_start")?.[0];
+    assert.ok(handler !== undefined, "session_start handler is registered");
+    const { ctx } = makeCtx();
+    return Promise.resolve(handler({ type: "session_start", reason }, ctx));
+  }
+
+  it("forgets the ticket on new, resume, and fork, so the next call dialogs", async () => {
+    for (const reason of ["new", "resume", "fork"]) {
+      const { records, spawnFn } = makeSpawn((child) => {
+        setTimeout(() => child.emit("close", 0, null), 0);
+      });
+      setSudoSpawnFn(spawnFn);
+      try {
+        const harness = makeHarness();
+        const tool = harness.tools.get("sudo_exec");
+        assert.ok(tool !== undefined);
+        const { ctx, calls } = makeCtx({ answers: [TICKET, once("hunter2")] });
+
+        const granted = await executeTool(tool, ctx, "systemctl restart nginx");
+        assert.equal(granted.details.approval, "ticket", reason);
+        assert.equal(calls.custom, 1, reason);
+        const before = records.length;
+
+        await startSession(harness, reason);
+        assert.equal(
+          records
+            .slice(before)
+            .some((record) => record.args.length === 1 && record.args[0] === "-k"),
+          true,
+          `${reason} must spawn sudo -k`,
+        );
+
+        const next = await executeTool(tool, ctx, "systemctl restart nginx");
+        assert.equal(calls.custom, 2, `${reason} must force a dialog on the next call`);
+        assert.equal(next.details.approval, "once", reason);
+      } finally {
+        setSudoSpawnFn(undefined);
+      }
+    }
+  });
+
+  it("keeps the granted ticket on reload", async () => {
+    const { records, spawnFn } = makeSpawn((child) => {
+      setTimeout(() => child.emit("close", 0, null), 0);
+    });
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx, calls } = makeCtx({ answers: [TICKET] });
+
+      const granted = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(granted.details.approval, "ticket");
+      const before = records.length;
+
+      await startSession(harness, "reload");
+      assert.deepEqual(
+        records.slice(before).filter((record) => record.args.includes("-k")),
+        [],
+        "reload must not spawn sudo -k",
+      );
+
+      const next = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(calls.custom, 1, "reload must keep the ticket silent");
+      assert.equal(next.details.approval, "ticket");
+      assert.equal(next.details.attempts, 0);
+      assert.equal(next.details.warm, true);
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+
+  it("clears a granted ticket when /sudo-forget runs", async () => {
+    const { records, spawnFn } = makeSpawn((child) => {
+      setTimeout(() => child.emit("close", 0, null), 0);
+    });
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx, calls } = makeCtx({ answers: [TICKET, once("hunter2")] });
+
+      const granted = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(granted.details.approval, "ticket");
+
+      const forget = harness.commands.get("sudo-forget");
+      assert.ok(forget !== undefined);
+      const before = records.length;
+      await forget.handler("", ctx);
+      assert.deepEqual(records[before].args, ["-k"]);
+
+      const next = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(calls.custom, 2, "/sudo-forget must make the next call dialog");
+      assert.equal(next.details.approval, "once");
     } finally {
       setSudoSpawnFn(undefined);
     }

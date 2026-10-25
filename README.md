@@ -1,6 +1,6 @@
 # pi-sudo
 
-`pi-sudo` adds one model-callable pi tool, `sudo_exec`. The tool shows a masked approval dialog in the terminal, asks for the sudo password there, and then runs the approved command as root itself. The model never receives the password.
+`pi-sudo` adds one model-callable pi tool, `sudo_exec`. The tool shows an approval dialog in the terminal, asks for the sudo password there when sudo needs one, and then runs the approved command as root itself. The model never receives the password.
 
 ## Install
 
@@ -32,18 +32,17 @@ Start a new pi session after installing. The package registers its extension fro
 
 The approval dialog shows:
 
-- The header `π sudo: approve root command`.
-- The sanitized command. Nothing is dropped: every byte the shell will receive is on screen. ANSI escapes, control bytes, and invisible/format characters become visible `<U+XXXX>` markers, tabs become spaces, and CR and LF become visible `<CR>` and `<LF>` markers. An escape sequence cannot hide a line of shell.
-- `Reason:` followed by the model's one-line reason for the request, sanitized like the command and shortened to one display line.
-- A masked password field that renders bullets, never the typed text.
-- On a retry, sudo's first error line above the field.
-- A footer with the available action.
+- A centred overlay, 80% wide and 90% tall, in a bordered frame titled `π sudo: Requesting root privilege`.
+- The whole command, sanitized so nothing is dropped: an escape sequence cannot hide a line of shell. It scrolls when it does not fit.
+- The model's reason, sudo's error line after a wrong password, and a dim key hint.
 
-When the wrapped command preview fits in 10 lines, the whole command is visible and Enter approves and runs it. When it is longer, Enter is disabled until the preview has been scrolled to the last line. Use Up/Down, PgUp/PgDn, Home, or End to scroll.
+Three choices: `Yes, once` (the default), `Yes, until sudo asks again`, and `No`. `↑/↓` move the selection, `Enter` confirms it, `Esc` denies; there is no Tab and no focus mode. `No` takes an optional reason, which reaches the model as `The user added: …` after the standard denial. A [DESIGN.md](./DESIGN.md#approval-versus-lifetime) section covers the keymap, the password-less warm shape, and why a reason can never ride along with an approval.
 
-Esc denies the request. Enter with an empty password also denies it. A denial runs no privileged command and returns an error result that tells the model not to retry the same command and to explain why root was needed. If sudo's ticket was already valid, the command had already run during the warm probe, before any dialog.
+The preview is 10 to 24 lines, sized to the terminal. A command too long for it hides the options until you reach the last line: the footer reads `You must read the full command to make a decision: scroll to the bottom.` above the scroll keys, and blank rows hold the options' place so the frame keeps its size. `End` jumps to the last line, `shift+↑/↓` pages.
 
-A wrong password reopens the dialog with sudo's error for up to three attempts. Only sudo's `Sorry, try again.` response is retried; other failures fail immediately. After the third rejection the result states that nothing was executed and asks the agent to confirm the password with the user instead of retrying blindly.
+Esc denies the request. Enter with an empty password does not: the `Password:` label turns red and the dialog waits, so a stray Enter cannot throw away the request. A denial runs nothing: the pre-dialog probe runs only `true` as root, to learn whether sudo will prompt, so your command never starts before you approve it. The denial returns an error result that tells the model not to retry the same command and to explain why root was needed.
+
+A wrong password reopens the dialog with sudo's error, up to three attempts; only sudo's `Sorry, try again.` is retried.
 
 ### Escalation confirmation
 
@@ -71,15 +70,15 @@ Enter declines with note · Tab back to Yes · Esc declines
 
 The note only reaches the model when you decline with it, as `The user added: …` after the standard denial text. It is stripped of control and format characters, collapsed to one line, and capped at 500 characters. Esc denies without a note. The patterns cover sudoers, PAM, account files and account commands, SUID/ACL/capability changes, destructive file changes, and non-read-only commands carrying paths under `/etc` or `/root`.
 
-### Tickets and `/sudo-forget`
+### Approval and sudo's ticket
 
-Sudo owns the ticket. After one authenticated run, later `sudo_exec` calls inside sudo's window skip the password dialog, exactly like a terminal that has already run sudo. Permission checks and escalation confirmations still run on every call. `/sudo-forget` runs `sudo -k` and is the only way this extension clears the ticket.
+Approval belongs to the extension; lifetime belongs to sudo. Every `sudo_exec` asks unless you chose `Yes, until sudo asks again`, which stops asking until sudo wants a password again — on this machine five minutes after the last sudo use. The grant lives in memory for the pi process and is cleared by a warm run that finds sudo asking, by `/sudo-forget`, and by `/new`, `/resume`, or `/fork`, which also run `sudo -k`. Your own terminal's ticket is a separate record and is untouched; `reload` keeps the grant.
 
-Only one approval can be open in a pi process at a time. A second concurrent `sudo_exec` call is rejected before any dialog or spawn.
+pi-sudo never sets, shortens, or extends sudo's ticket. The measured window, why a session switch needs its own `sudo -k`, and the risk that ticket mode carries are in [DESIGN.md](./DESIGN.md#approval-versus-lifetime).
 
 ## Design and limits
 
-[`DESIGN.md`](./DESIGN.md) explains how the password path, the warm probe, the escalation gate, and the bash guard work, and lists the guarantees and the boundaries that are intentional for this version. Read the boundaries before relying on the tool: other extensions can see keystrokes, a root command can phish the shared terminal, the bash guard is a nudge, path checks are heuristic, and the ticket window is sudo's to choose.
+[`DESIGN.md`](./DESIGN.md) explains how the password path, the probe, the escalation gate, and the bash guard work, and lists the guarantees and the boundaries that are intentional for this version. Read the boundaries before relying on the tool: other extensions can see keystrokes, a root command can print a fake prompt, the bash guard is a nudge, path checks are heuristic, and the ticket window is sudo's to choose.
 
 ## Running the tests
 

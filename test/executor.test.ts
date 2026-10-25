@@ -8,6 +8,7 @@ import { describe, it } from "node:test";
 import {
   fail,
   forgetTicket,
+  probeTicket,
   resolveSudo,
   runCold,
   runWarm,
@@ -99,7 +100,7 @@ function mode(file: string): Promise<number> {
 const PASSWORD = "s3cret-pw";
 
 describe("executor", () => {
-  it("warm probe runs the real command with -n, LC_ALL=C, and merged stderr", async () => {
+  it("warm run executes the approved command with -n, LC_ALL=C, and merged stderr", async () => {
     const { records, spawnFn } = makeSpawn();
     const run = runWarm({ command: "id -u", cwd: "/tmp", spawnFn });
     const rec = await nextSpawn(records);
@@ -121,6 +122,40 @@ describe("executor", () => {
       assert.equal(outcome.result.exitCode, 0);
     }
     assert.equal(records.every((entry) => !entry.args.includes("-k")), true, "warm runs never spawn sudo -k");
+  });
+
+  it("probeTicket runs true as root and never the user's command", async () => {
+    const { records, spawnFn } = makeSpawn();
+    const probe = probeTicket({ cwd: "/tmp", spawnFn });
+    const rec = await nextSpawn(records);
+
+    assert.equal(rec.cmd, resolveSudo());
+    assert.equal(rec.args[0], "-n");
+    assert.equal(rec.args[1], "-p");
+    assert.equal(rec.args[3], "--");
+    assert.deepEqual(rec.args.slice(4), ["/bin/sh", "-c", "exec 2>&1; true"]);
+    assert.equal(payloadFrom(rec.args), "exec 2>&1; true");
+    assert.equal(rec.args.join(" ").includes("systemctl"), false);
+    assert.equal(rec.opts.env?.LC_ALL, "C");
+
+    rec.child.finish(0);
+    assert.equal(await probe, true);
+  });
+
+  it("probeTicket reports false when sudo demands a password, writing nothing", async () => {
+    const { records, spawnFn } = makeSpawn();
+    const probe = probeTicket({ cwd: "/tmp", spawnFn });
+    const rec = await nextSpawn(records);
+    assert.equal(payloadFrom(rec.args), "exec 2>&1; true");
+
+    // sudo's real prompt line, and the -p nonce never appeared: no secret exists.
+    rec.child.stderr.emit("data", Buffer.from("sudo: a password is required\n"));
+    rec.child.finish(1);
+
+    assert.equal(await probe, false);
+    assert.equal(nonceFrom(rec.args).includes("pi-sudo:"), true);
+    assert.equal(rec.child.stdin.writes.length, 0);
+    assert.equal(rec.child.stdin.ended, true);
   });
 
   it("cold run uses -S -p, writes the password once on the nonce, newline separately, then ends stdin", async () => {

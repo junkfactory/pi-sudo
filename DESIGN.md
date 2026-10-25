@@ -37,20 +37,46 @@ The hard part is telling sudo's prompt apart from command output, because the co
 - **Two writes.** The password buffer goes to stdin first, then `"\n"` as a separate write, then stdin ends. A single write would let sudo consume the newline as part of the password when the buffer is delivered in one chunk.
 - **Zeroing.** The buffer is zeroed on stdin `finish` or child `close`, whichever comes first, and deliberately not before close: Node may hand the buffer to libuv without copying.
 - **No exit code trust for the prompt.** If the nonce never appears within five seconds, stdin is ended without writing. Zero exit then means the command ran warm; non-zero is a failure. Neither branch writes the password.
-- **What is never written.** Not the sudo argv, the environment, the full-output file, tool details, notifications, logs, or the session. Tool details are `command`, `exitCode`, `durationMs`, `attempts`, `warm`, `policyChecked`.
+- **What is never written.** Not the sudo argv, the environment, the full-output file, tool details, notifications, logs, or the session. Tool details are `command`, `exitCode`, `durationMs`, `attempts`, `warm`, `approval`, `policyChecked`. `approval` is `once` or `ticket` for a run that happened, and absent when nothing ran.
 
 `PasswordField` stores the value in a `Buffer`, renders bullets, and returns a copy from `take()` truncated at the first CR or LF, so a paste with a trailing newline cannot corrupt the password. pi's own `Input` component stores strings, which is why it is not used.
 
-## Ticket model
+## Preview sanitising
 
-Sudo owns the ticket. pi-sudo never sets, shortens, or extends it, and never runs `sudo -k` after a run.
+What the approver reads must be what runs, so the command and the reason are rendered rather than cleaned: tabs become two spaces, CR and LF become `<CR>` and `<LF>`, and C0, DEL, C1 and format code points become `<U+XXXX>`. Nothing is dropped. An earlier version deleted escape-sequence bodies, which let a command hide a whole shell line from the approver while `/bin/sh` still executed it.
 
-- Before the dialog, the real command runs with `sudo -n` as a warm probe. Valid ticket: the command runs, no dialog, `warm: true`. Password required: nothing ran, so the dialog path starts.
-- The probe uses the same `/bin/sh -c` payload as the authenticated run, so a command is never executed twice and a command-specific `NOPASSWD` rule cannot be probed with a different command.
-- `/sudo-forget` runs `sudo -k` and is the only ticket-clearing path.
-- Permission checks and escalation confirmations run on every call, warm or cold.
+The denial reason goes through the same map, then collapses to a single line and is capped at 500 characters, because it becomes model input.
 
-The consequence is deliberate and documented: after one authenticated run, later calls inside sudo's window run without a password dialog, exactly like a terminal where sudo was already used. A session password cache was rejected: it would keep the secret in the pi process and invent a second lifetime to reason about.
+## Approval versus lifetime
+
+Approval belongs to the extension; lifetime belongs to sudo. pi-sudo never sets, shortens, or extends sudo's ticket. One in-memory boolean per extension instance records a ticket-wide approval, and the flow is:
+
+```text
+sudo_exec
+  └─ ticket grant held?
+       ├─ yes → warm run of the user's command, approval: "ticket"
+       │          └─ needsPassword → grant cleared, dialog with the password field
+       └─ no  → probeTicket(): sudo -n true
+              └─ approval dialog: three options, password row only when the probe found sudo cold
+                       ├─ No          → nothing ran; a typed reason reaches the model as "The user added: …"
+                       ├─ Yes, once   → warm run (probe warm) or cold run, approval: "once"
+                       └─ Yes, until  → same run, grant set, approval: "ticket"
+```
+
+The probe runs `true` as root, not the user's command, so a denial genuinely runs nothing. The user's command reaches root only after the dialog returned an approval, or behind a grant the user gave earlier. The probe costs one short-lived root process; it avoids the old behaviour where a valid ticket executed the command before the dialog, which made a denial a lie. `true` only refreshes sudo's own timestamp, which is sudo's business, and it tells the extension exactly what it needs: whether sudo would prompt.
+
+The dialog itself is a centred overlay (80% of the terminal wide, 90% tall, both dialogs use it so the two screens do not jump) drawn as one bordered frame titled `π sudo: Requesting root privilege`: the model's reason, then the sanitized command preview, then three stacked options — `Yes, once` preselected, `Yes, until sudo asks again`, and `No`. `↑/↓` move the selection, `shift+↑/↓` page the preview (PgUp/PgDn, Home, and End too, where the keyboard has them), Enter confirms, and Esc declines silently. A preview taller than the viewport hides the options altogether: the divider stays, a blank row follows it, and the footer says `You must read the full command to make a decision: scroll to the bottom.` above the dim scroll keys. Pressing Enter early turns that line red, and `End` jumps to the last line. The hint wraps rather than being truncated on a narrow terminal, and blank rows hold the options' place, so opening the gate does not resize the frame and the centred overlay does not jump. Only when the last line has been on screen do the options appear and Enter start to work. There is no focus mode: every other key goes to the field the selected row owns, the password on either `Yes` when the probe found sudo cold, and the denial reason on `No`, whose placeholder reads `enter reason for denial (optional)`. The reason hangs off `No` alone for the same reason the escalation note does: a note must never ride along with an approval. A `No` with text returns it as `The user added: …` after the standard denial, sanitized to one line and capped at 500 characters; an empty reason or Esc returns the plain denial. A warm ticket has no password row at all, since sudo would ignore what was typed. Enter with an empty password does not deny: it turns the `Password:` label red and leaves the dialog open, because an empty field is a slip, not a decision — Esc is the only silent denial in that state.
+
+The grant is per extension instance rather than process-global because approval is per session. A new, resumed, or forked session is a different piece of work with a different command history, so it starts without a grant. A process-global boolean would carry one session's approval into the next, and it would leak across subagent nodes that share `globalThis`. The mutex is deliberately global; approval is deliberately not.
+
+The measured window on this machine (sudo 1.9.17p2, `timestamp_type=tty`, `timestamp_timeout=5` minutes): `sudo -v` at 18:58:15, then `sudo -n true` exit 0 at 19:02:17 and exit 0 at 19:04:17, verified 2026-10-25 in one terminal. A warm use restarts the window, so it slides: the ticket option means no prompt until five minutes after the last sudo use, not five minutes after authentication. That is why the label says "until sudo asks again" and names no expiry.
+
+Two boundaries:
+
+- **Ticket mode is revocable only by three events plus `/sudo-forget`.** A warm run that finds sudo demanding a password clears the grant, `/sudo-forget` clears it explicitly, and a session start with reason `new`, `resume`, or `fork` clears it. Nothing else does: `reload` and `startup` keep both the grant and the ticket. Because the window slides, an agent that runs a root command more often than every five minutes never sees another dialog.
+- **The session-change `sudo -k` clears pi's record, not your terminal's.** pi spawns sudo with pipes and no controlling terminal (`tty` reports `not a tty`), and `timestamp_type=tty` falls back to the parent process ID when no terminal is present (`man sudoers`). The record is therefore keyed on pi's pid, which a `new`, `resume`, or `fork` session switch does not change — that is exactly why those three run `sudo -k`. Without it, a new session would inherit a warm record. Your shell's tty-keyed record is a different entry and is untouched; a restarted pi starts cold on its own.
+
+A session password cache was rejected: it would keep the secret in the pi process and invent a second lifetime to reason about.
 
 ## Escalation gate
 
@@ -100,6 +126,8 @@ Timeouts send SIGTERM, then SIGKILL after a three-second grace period. Signal fo
 
 A stdin `error` such as EPIPE is handled and cannot throw with the password still live.
 
+A wrong password is retried only when sudo printed its `Sorry, try again.` line, up to three attempts; every other failure ends the call. After the third rejection the result tells the model not to retry blindly and to confirm the password with the user.
+
 Full output that exceeds the model-visible cap is written to a `0600` file inside a `0700` directory, and the model receives the path. If that write fails, the result says the full output was lost.
 
 ## Startup temp sweep
@@ -121,14 +149,15 @@ On `session_start` the extension removes every `pi-sudo-*` directory under the s
 - A stdin error cannot throw with the password live.
 - An abort or timeout sends SIGTERM, then SIGKILL after three seconds.
 - Truncated full output goes to a `0600` file in a `0700` directory, and a failed write is reported.
-- The only `sudo -k` spawn is in `/sudo-forget`.
+- The only `sudo -k` spawns are `/sudo-forget` and `session_start` with reason `new`, `resume`, or `fork`.
+- The user's command runs only after the dialog returned an approval, or behind a ticket-wide approval from earlier; the pre-dialog probe runs `true`, not the command.
 
 ## Boundaries
 
 Intentional limits for this version. Read them before relying on the tool.
 
 - **Other extensions can see keystrokes.** `ctx.ui.onTerminalInput` receives raw input before the dialog component, so a malicious extension can read the password as it is typed. This cannot be fixed inside `pi-sudo`.
-- **The terminal is shared.** The sudo child is not detached, so it shares pi's controlling terminal and sudo's tty ticket. A root command can print a fake prompt or read `/dev/tty` to phish the user. Merging the command's stderr into its stdout keeps ordinary output off the executor's pipe, but a root command can still reopen that pipe via `/proc/<sudo-pid>/fd/2`; that matters only if the ticket warmed between probe and run, and in that state sudo already runs commands without a dialog.
+- **A root command can impersonate a prompt.** The sudo child is spawned with pipes and, as measured, no controlling terminal, so it cannot read `/dev/tty` or the terminal's keystrokes. It can still print text that looks like a prompt into the live output stream, and it can reopen the executor's stderr pipe via `/proc/<sudo-pid>/fd/2`. Forging that pipe matters only if the ticket went cold between probe and run; in that state sudo itself is prompting and the user's command has not started.
 - **The bash guard is a nudge.** Only the `bash` tool, only command position, only this word list. Extension-provided shell tools and replaced bash tools are outside it.
 - **Path checks are heuristic.** Tokens are split on whitespace and shell punctuation and resolved against the working directory, with `~/` against the home directory. Paths inside variables, shell expansions, or a program's own arguments escape them. The dialog remains the gate.
 - **Signals may not reach grandchildren.** SIGTERM goes to sudo; sudo normally relays it, but the SIGKILL goes to the sudo process.
@@ -136,7 +165,7 @@ Intentional limits for this version. Read them before relying on the tool.
 - **Binary-specific `NOPASSWD` rules do not match this payload.** The command is always `/bin/sh -c ...`, so `NOPASSWD: /usr/bin/reboot` does not apply and such commands still prompt.
 - **Buffer hygiene is best-effort.** Buffers are zeroed after close and the field is cleared on denial, but Node strings, Buffers, libuv, terminal input, and garbage-collected copies can retain bytes. The code avoids converting the password to a string or logging it; JavaScript cannot guarantee erasure.
 - **The tool is TUI-only.** RPC, JSON, and print modes fail closed.
-- **The ticket window is high risk by design.** Once a run authenticates, commands run as root without a dialog until sudo's window expires. Policy checks and escalation confirmations still run, and `/sudo-forget` clears it.
+- **Ticket-wide approval is high risk by design.** After `Yes, until sudo asks again`, commands run as root without a dialog until sudo asks again, which on this machine is five minutes after the last sudo use. A denial is still a real denial: the probe runs `true`, so nothing of the user's command executes before the dialog. Policy checks and escalation confirmations still run, and `/sudo-forget` clears both the grant and the ticket.
 - **The temp sweep has no age check.** It now only removes retained full-output directories, since a run creates none of its own. See above.
 
 ## Rejected alternatives

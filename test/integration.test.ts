@@ -145,6 +145,10 @@ interface DialogDrive {
   /** Escalation answer: true approves, false declines (optionally with a note). */
   approve?: boolean;
   note?: string;
+  /** Approval dialog: types this reason on the No row and declines. */
+  declineReason?: string;
+  /** Approval dialog: presses Enter with no password, then Esc. */
+  emptySubmit?: boolean;
   /** Keeps the dialog open until released. */
   hold?: Promise<void>;
 }
@@ -152,7 +156,7 @@ interface DialogDrive {
 type DialogComponent = { handleInput(data: string): void };
 
 type DialogFactory = (
-  tui: { requestRender(): void },
+  tui: { requestRender(): void; terminal: { rows: number } },
   theme: { fg(color: string, text: string): string },
   keybindings: Record<string, never>,
   done: (value: unknown) => void,
@@ -183,15 +187,28 @@ function makeCtx(options: CtxOptions = {}): { ctx: ExtensionToolContext; calls: 
       calls.order.push("dialog");
       return new Promise<unknown>((done) => {
         const component = factory(
-          { requestRender: () => {} },
+          { requestRender: () => {}, terminal: { rows: 40 } },
           { fg: (_color: string, text: string) => text },
           {},
           done,
         );
         void (async () => {
           if (drive.hold !== undefined) await drive.hold;
+          if (drive.emptySubmit === true) {
+            component.handleInput("\r");
+            component.handleInput("\x1b");
+            return;
+          }
           if (drive.escape === true) {
             component.handleInput("\x1b");
+            return;
+          }
+          if (drive.declineReason !== undefined) {
+            // Two rows down reach the No row of the three-option approval dialog.
+            component.handleInput("\x1b[B");
+            component.handleInput("\x1b[B");
+            component.handleInput(drive.declineReason);
+            component.handleInput("\r");
             return;
           }
           if (drive.approve !== undefined) {
@@ -261,8 +278,8 @@ after(() => {
 });
 
 describe("sudo_exec integration: dialog outcomes", () => {
-  it("returns the denial result for Esc and for an empty password", async () => {
-    for (const drive of [{ escape: true }, {}] as DialogDrive[]) {
+  it("returns the denial result for Esc and for an empty password followed by Esc", async () => {
+    for (const drive of [{ escape: true }, { emptySubmit: true }] as DialogDrive[]) {
       const { records, spawnFn } = makeSpawn((child) => needsPassword(child));
       setSudoSpawnFn(spawnFn);
       try {
@@ -276,6 +293,24 @@ describe("sudo_exec integration: dialog outcomes", () => {
       } finally {
         setSudoSpawnFn(undefined);
       }
+    }
+  });
+
+  it("carries the approval dialog's denial reason into the result text", async () => {
+    const note = "restart nginx from the deploy job instead";
+    const { records, spawnFn } = makeSpawn((child) => needsPassword(child));
+    setSudoSpawnFn(spawnFn);
+    try {
+      const { ctx, calls } = makeCtx({ dialogs: [{ declineReason: note }] });
+      const result = await execute(toolFrom(), ctx, "systemctl restart nginx");
+      assert.equal(result.isError, true);
+      assert.equal(result.details.attempts, 0);
+      assert.equal(textOf(result), `${DENIAL_TEXT}\n\nThe user added: ${note}`);
+      assert.equal(calls.custom, 1);
+      assert.equal(records.length, 1, "only the warm probe may spawn");
+      assert.ok(records.every((record) => isWarm(record.args)));
+    } finally {
+      setSudoSpawnFn(undefined);
     }
   });
 
@@ -523,8 +558,10 @@ describe("sudo_exec integration: escalation and mutex", () => {
 });
 
 describe("sudo_exec integration: warm, non-TUI, and hygiene", () => {
-  it("runs the warm path with no dialog", async () => {
-    const { records, spawnFn } = makeSpawn((child) => succeeded(child, "active\n"));
+  it("probes with true, asks for approval on a warm ticket, then runs warm", async () => {
+    const { records, spawnFn } = makeSpawn((child, _args, index) => {
+      succeeded(child, index === 0 ? "" : "active\n");
+    });
     setSudoSpawnFn(spawnFn);
     try {
       const { ctx, calls } = makeCtx();
@@ -532,10 +569,16 @@ describe("sudo_exec integration: warm, non-TUI, and hygiene", () => {
       assert.equal(result.isError, false);
       assert.equal(result.details.warm, true);
       assert.equal(result.details.attempts, 0);
-      assert.equal(calls.custom, 0);
+      assert.equal(result.details.approval, "once");
+      assert.equal(calls.custom, 1, "a warm ticket must still be approved");
       assert.equal(calls.confirm, 0);
-      assert.equal(records.length, 1);
-      assert.ok(isWarm(records[0].args));
+      assert.equal(records.length, 2, "one true probe and one approved run");
+      assert.ok(records.every((record) => isWarm(record.args)));
+      assert.equal(records[0].args[records[0].args.length - 1], "exec 2>&1; true");
+      assert.equal(
+        records[1].args[records[1].args.length - 1],
+        "exec 2>&1; systemctl restart nginx",
+      );
       assert.match(textOf(result), /^\$ systemctl restart nginx\nexit code: 0/);
       assert.match(textOf(result), /active/);
     } finally {
@@ -617,14 +660,14 @@ describe("sudo_exec integration: warm, non-TUI, and hygiene", () => {
   });
 
   it("streams command stdout through onUpdate and never streams sudo stderr", async () => {
-    const { spawnFn } = makeSpawn((child, args, index) => {
+    const { spawnFn } = makeSpawn((child, _args, index) => {
       if (index === 0) {
+        // The probe runs `true`; its stderr is sudo's, not the command's.
         child.stderr.emit("data", Buffer.from("sudo: a notice\n"));
-        succeeded(child, "chunk-1\n");
+        succeeded(child);
         return;
       }
-      prompted(child, args);
-      succeeded(child, "second\n");
+      succeeded(child, "chunk-1\n");
     });
     setSudoSpawnFn(spawnFn);
     try {
