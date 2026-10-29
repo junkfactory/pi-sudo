@@ -173,29 +173,30 @@ describe("ApprovalDialog", () => {
     const command = `echo ${"needle ".repeat(200)}`;
     const h = harness(command);
     const view = (): string[] => h.dialog.render(WIDTH).map(plain);
-    const header = (): string => view().find((line) => line.includes("Command")) ?? "";
+    // The visible range moved to the footer when the reason joined the scroll.
+    const range = (): string => view().find((line) => /\d+-\d+\/\d+/.test(line)) ?? "";
     const arrow = (): string => view().find((line) => line.includes("\u2192")) ?? "";
 
-    const first = header();
-    assert.match(first, /lines 1-/);
+    const first = range();
+    assert.match(first, /1-\d+\/\d+/);
     h.dialog.handleInput(SHIFT_DOWN);
-    assert.notEqual(header(), first);
-    assert.match(header(), /lines 11-/);
+    assert.notEqual(range(), first);
+    assert.match(range(), /11-\d+\/\d+/);
 
-    const afterShiftDown = header();
+    const afterShiftDown = range();
     h.dialog.handleInput(PAGE_DOWN);
-    assert.notEqual(header(), afterShiftDown);
+    assert.notEqual(range(), afterShiftDown);
 
-    const afterPageDown = header();
+    const afterPageDown = range();
     h.dialog.handleInput(SHIFT_UP);
-    assert.notEqual(header(), afterPageDown);
+    assert.notEqual(range(), afterPageDown);
 
-    const afterShiftUp = header();
+    const afterShiftUp = range();
     h.dialog.handleInput(PAGE_UP);
-    assert.notEqual(header(), afterShiftUp);
+    assert.notEqual(range(), afterShiftUp);
 
     h.dialog.handleInput(HOME);
-    assert.equal(header(), first);
+    assert.equal(range(), first);
     // The options only appear at the end, and the selection never moved.
     h.dialog.handleInput(END);
     assert.ok(arrow().includes("Yes, once"), "scrolling must not move the selection");
@@ -602,6 +603,27 @@ describe("ApprovalDialog (fingerprint)", () => {
       const rows = dialog.render(WIDTH).length;
       assert.ok(rows <= 20, `frame is ${rows} rows for a 20-row budget (fingerprint: ${fingerprint})`);
     }
+  });
+
+  it("scrolls a long reason instead of growing past the budget", () => {
+    const reason = "the model wrote a long rationale ".repeat(40);
+    const dialog = createApprovalDialog({
+      command: "id",
+      reason,
+      warm: false,
+      rows: 20,
+      theme: plainTheme,
+      done: () => {},
+    });
+    const gated = dialog.render(WIDTH);
+    assert.ok(gated.length <= 20, `frame is ${gated.length} rows for a 20-row budget`);
+    assert.equal(dialog.sawEnd, false, "the reason alone fills the viewport");
+    dialog.handleInput(END);
+    const open = dialog.render(WIDTH);
+    const text = open.map(plain).join("\n");
+    assert.equal(open.length, gated.length, "opening the gate does not resize the frame");
+    assert.ok(text.includes("Yes, once"), "the options are reachable after scrolling");
+    assert.ok(text.includes("esc deny"), "the footer survives a long reason");
   });
 
   it("re-checks the read gate when the password field submits without Enter", () => {

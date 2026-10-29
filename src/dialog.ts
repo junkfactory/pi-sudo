@@ -18,6 +18,7 @@ const COMMAND_INDENT = "  ";
 /** Frame title shown above the command preview. */
 const TITLE = "\u03c0 sudo: Requesting root privilege";
 const REASON_LABEL = "Reason: ";
+const COMMAND_LABEL = "Command:";
 const DENIAL_PLACEHOLDER = "enter reason for denial (optional)";
 // While the preview is not fully read, the options are not rendered at all: the
 // footer carries the requirement instead, so there is nothing to choose yet.
@@ -186,7 +187,7 @@ export class ApprovalDialog implements Component, Focusable {
       options.errorText === undefined ? undefined : sanitizeForDisplay(options.errorText);
     this.#scroll = new ScrollView(
       {
-        render: (width: number) => this.#wrap(width),
+        render: (width: number) => this.#scrollContent(width),
         invalidate: () => {},
       },
       // No scrollbar: pi-tui draws the thumb in its own layout pass, which a
@@ -223,14 +224,6 @@ export class ApprovalDialog implements Component, Focusable {
     const inner = innerWidth(width);
     const previewWidth = Math.max(1, inner - COMMAND_INDENT.length);
     const content = this.#scroll.render(previewWidth);
-    const reasonLines = wrapTextWithAnsi(
-      `${theme.fg("dim", REASON_LABEL)}${this.#reasonText}`,
-      inner,
-    );
-    const errorLines =
-      this.#errorText === undefined
-        ? []
-        : wrapTextWithAnsi(theme.fg("error", `sudo: ${this.#errorText}`), inner);
     // The reader hint is wrapped at the same width the hint rows use, once, so
     // the closed gate can reserve exactly the rows the open state will draw.
     const readerWidth = Math.max(1, inner - COMMAND_INDENT.length);
@@ -242,19 +235,11 @@ export class ApprovalDialog implements Component, Focusable {
       readerWidth,
     );
     const extraRows = (this.#warm ? 0 : 1) + readerLines.length;
-    // Every row the preview does not own: borders, reason, command header,
-    // error, divider, options, the cold password row (plus the reader hint
-    // above it), the blank row above the footer, and the footer itself.
-    const reserved =
-      2 +
-      reasonLines.length +
-      errorLines.length +
-      1 +
-      1 +
-      OPTION_LABELS.length +
-      extraRows +
-      1 +
-      1;
+    // Every row the scroll view does not own: borders, divider, options, the
+    // cold password row (plus the reader hint above it), the blank row above the
+    // footer, and the footer itself. Reasoning and sudo errors scroll with the
+    // command, so a long one can never push the options off the screen.
+    const reserved = 2 + 1 + OPTION_LABELS.length + extraRows + 1 + 1;
     // A short terminal must not be over-budget: the preview shrinks to one row
     // instead of forcing ten, so the overlay never clips the footer or border.
     const previewRows = Math.min(
@@ -274,16 +259,13 @@ export class ApprovalDialog implements Component, Focusable {
     const overflow = height > previewRows;
     const top = Math.min(this.#scroll.scrollTop, Math.max(0, height - previewRows));
     this.#sawEnd = !overflow || top >= height - previewRows;
+    // The position goes last and in compact form: on a narrow terminal the keys
+    // matter more than the line range, so the range is what gets clipped.
     const range = overflow
-      ? ` (lines ${top + 1}-${Math.min(top + previewRows, height)} of ${height})`
+      ? ` · ${top + 1}-${Math.min(top + previewRows, height)}/${height}`
       : "";
 
     const lines: string[] = [topRule(theme, width)];
-    lines.push(...reasonLines.map((line) => frameRow(line, width)));
-    if (errorLines.length > 0) {
-      lines.push(...errorLines.map((line) => frameRow(line, width)));
-    }
-    lines.push(frameRow(theme.fg("dim", `Command${range}:`), width));
     for (const line of content.slice(top, top + previewRows)) {
       lines.push(frameRow(`${COMMAND_INDENT}${line}`, width));
     }
@@ -313,7 +295,7 @@ export class ApprovalDialog implements Component, Focusable {
       lines.push(...hint.map((line) => frameRow(`${COMMAND_INDENT}${line}`, width)));
       for (let row = 0; row < pad; row += 1) lines.push(frameRow("", width));
       for (let row = 0; row < extraRows; row += 1) lines.push(frameRow("", width));
-      lines.push(frameRow(theme.fg("dim", HINT_READ_KEYS), width));
+      lines.push(frameRow(theme.fg("dim", `${HINT_READ_KEYS}${range}`), width));
     } else {
       lines.push(...this.#optionLines(inner).map((line) => frameRow(line, width)));
       // A warm ticket makes sudo ignore any typed password, so no row at all.
@@ -330,7 +312,7 @@ export class ApprovalDialog implements Component, Focusable {
       }
       // A blank row keeps the footer from crowding the options.
       lines.push(frameRow("", width));
-      lines.push(frameRow(theme.fg("dim", HINT_KEYS), width));
+      lines.push(frameRow(theme.fg("dim", `${HINT_KEYS}${range}`), width));
     }
     lines.push(bottomRule(width));
     return lines;
@@ -428,6 +410,25 @@ export class ApprovalDialog implements Component, Focusable {
     const lines = wrapTextWithAnsi(sanitizeForDisplay(this.#command), width);
     this.#wrappedLines = lines.length > 0 ? lines : [""];
     return this.#wrappedLines;
+  }
+
+  /**
+   * Everything the scroll view owns, in reading order: the model's reason, sudo's
+   * error when there is one, then the command. Keeping them in the viewport means
+   * a long reason scrolls instead of growing the frame and pushing the options off
+   * a short terminal, and reaching the end means every row was on screen.
+   */
+  #scrollContent(width: number): string[] {
+    const theme = this.#theme;
+    const head = wrapTextWithAnsi(
+      `${theme.fg("dim", REASON_LABEL)}${this.#reasonText}`,
+      width,
+    );
+    const error =
+      this.#errorText === undefined
+        ? []
+        : wrapTextWithAnsi(theme.fg("error", `sudo: ${this.#errorText}`), width);
+    return [...head, ...error, theme.fg("dim", COMMAND_LABEL), ...this.#wrap(width)];
   }
 
   #scrollBy(delta: number): void {
