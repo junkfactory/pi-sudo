@@ -33,6 +33,14 @@ const MUTEX_BUSY_TEXT =
 const POLICY_ERROR_TEXT = "The permission policy could not be checked; nothing ran.";
 const ATTEMPTS_TEXT =
   "sudo rejected the password 3 times; the command was not executed and nothing else ran. Do not retry this call blindly: confirm with the user that they entered the right password and that the account can use sudo, then try again if needed.";
+const FINGERPRINT_FAILED_TEXT =
+  "Fingerprint authentication did not succeed and no password was typed; nothing ran. sudo may not accept this reader. Call sudo_exec again and type the sudo password, or touch the reader when it asks.";
+const AUTH_WAIT_TEXT =
+  "\n[pi-sudo] waiting for sudo authentication: fingerprint reader or password prompt\n";
+/** How long a cold run waits without output before the status line explains the wait. */
+const AUTH_WAIT_MS = 3000;
+/** sudo's verdict when it was offered nothing to authenticate with. */
+const NO_PASSWORD_PROVIDED = "no password was provided";
 
 const SUDO_GUARD_REASON =
   "`sudo` needs an interactive password prompt, which bash cannot provide here. Use the sudo_exec tool with the command itself (no leading sudo).";
@@ -110,6 +118,8 @@ export interface SudoExecDetails {
   warm: boolean;
   /** Which approval the user gave. Absent when nothing ran. */
   approval?: "once" | "ticket";
+  /** How root was authenticated on a cold run. Absent for warm runs. */
+  auth?: "password" | "fingerprint";
   policyChecked: boolean;
 }
 
@@ -219,6 +229,7 @@ function execResult(
   attempts: number,
   policyChecked: boolean,
   approval: "once" | "ticket",
+  auth?: "password" | "fingerprint",
 ): AgentToolResult<SudoExecDetails> {
   const exit = result.exitCode === null ? "none (killed)" : String(result.exitCode);
   const header = `$ ${result.command}\nexit code: ${exit}`;
@@ -236,6 +247,7 @@ function execResult(
       warm: result.warm,
       approval,
       policyChecked,
+      ...(auth === undefined ? {} : { auth }),
     },
     isError: !result.ok,
   };
@@ -314,6 +326,11 @@ const parameters = Type.Object({
 });
 
 let spawnImpl: SpawnFn = spawn;
+// Learned facts about the machine's sudo/PAM stack. In memory only, never
+// persisted: `readerLearned` survives session switches, `readerRejected` does
+// not; both die with the process or an extension reload.
+let readerLearned = false;
+let readerRejected = false;
 let permissionServiceImpl:
   | ((sessionId: string) => PermissionsService | undefined)
   | undefined;
@@ -348,6 +365,8 @@ export default function (pi: ExtensionAPI) {
     // The user's own terminal keeps its own, separate ticket.
     if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
       ticketGranted = false;
+      // A new session may run on another machine: ask the reader again.
+      readerRejected = false;
       await forgetTicket(spawnImpl).catch(() => {});
     }
     await sweepStaleTemp().catch(() => {});
@@ -465,10 +484,12 @@ export default function (pi: ExtensionAPI) {
       // Live command stdout. Throttled so a chatty root command cannot flood the TUI.
       let partial = "";
       let lastEmit = 0;
+      let sawCommandOutput = false;
       const streamOutput = (chunk: string): void => {
         partial += chunk;
         if (partial.length > 8000) partial = partial.slice(-8000);
         if (onUpdate === undefined) return;
+        sawCommandOutput = true;
         const now = Date.now();
         if (now - lastEmit < 100) return;
         lastEmit = now;
@@ -520,9 +541,11 @@ export default function (pi: ExtensionAPI) {
         let attempts = 0;
         let lastError: string | undefined;
         while (attempts < MAX_ATTEMPTS) {
+          const showReader = !warm && readerLearned && !readerRejected && lastError === undefined;
           const answer = await askApproval(ctx, command, reason, {
             warm,
             errorText: lastError,
+            fingerprint: showReader,
           });
           if (!answer.approved) {
             const suffix =
@@ -552,19 +575,60 @@ export default function (pi: ExtensionAPI) {
             continue;
           }
           attempts += 1;
-          const outcome = await runCold({
-            command,
-            cwd: ctx.cwd,
-            password: answer.password,
-            timeoutSec,
-            signal,
-            spawnFn: spawnImpl,
-            onOutput: streamOutput,
-          });
-          if (outcome.status === "ran") {
-            return execResult(outcome.result, attempts, policyChecked, answer.mode);
+          // sudo's password prompt arrives on the pipe index never sees live, so
+          // "has not prompted" is approximated by "no command output yet". The
+          // note is UI-only and never enters the model-facing result.
+          sawCommandOutput = false;
+          const authWaitTimer =
+            onUpdate === undefined
+              ? undefined
+              : setTimeout(() => {
+                  if (sawCommandOutput) return;
+                  onUpdate({
+                    content: [{ type: "text", text: AUTH_WAIT_TEXT }],
+                    details: details({ attempts, policyChecked }),
+                  });
+                }, AUTH_WAIT_MS);
+          authWaitTimer?.unref?.();
+          let outcome: Awaited<ReturnType<typeof runCold>>;
+          try {
+            outcome = await runCold({
+              command,
+              cwd: ctx.cwd,
+              password: answer.password,
+              timeoutSec,
+              signal,
+              spawnFn: spawnImpl,
+              onOutput: streamOutput,
+            });
+          } finally {
+            if (authWaitTimer !== undefined) clearTimeout(authWaitTimer);
           }
-          lastError = firstStderrLine(outcome.result.sudoStderr);
+          const result = outcome.result;
+          if (answer.password.length === 0) {
+            // The fingerprint route runs once: no dialog loop for an empty answer.
+            if (result.ok) {
+              readerLearned = true;
+              return execResult(result, attempts, policyChecked, answer.mode, "fingerprint");
+            }
+            if (result.sudoStderr.includes(NO_PASSWORD_PROVIDED)) {
+              // sudo does not accept the reader: stop offering it until the
+              // session changes, so the next dialog asks for the password.
+              readerRejected = true;
+              return textResult(
+                FINGERPRINT_FAILED_TEXT,
+                true,
+                details({ attempts, policyChecked }),
+              );
+            }
+            return execResult(result, attempts, policyChecked, answer.mode, "fingerprint");
+          }
+          // The run itself is the only honest witness to a biometric delay.
+          readerLearned = readerLearned || result.authEvidence;
+          if (outcome.status === "ran") {
+            return execResult(result, attempts, policyChecked, answer.mode, "password");
+          }
+          lastError = firstStderrLine(result.sudoStderr);
         }
         return textResult(
           ATTEMPTS_TEXT,

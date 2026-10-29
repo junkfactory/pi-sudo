@@ -25,6 +25,8 @@ const HINT_READ =
   "You must read the full command to make a decision: scroll to the bottom.";
 const HINT_READ_KEYS = "shift+↑↓ scroll · PgUp/PgDn · End · esc deny";
 const HINT_KEYS = "↑↓ navigate · enter confirm · esc deny";
+const HINT_FINGERPRINT =
+  "empty password: authenticate with the fingerprint reader · typed password: fallback if the reader times out";
 
 /** Columns taken by the frame itself: "│ " + " │". */
 const FRAME_CHROME = 4;
@@ -115,6 +117,8 @@ export interface ApprovalDialogOptions {
   reason: string;
   errorText?: string;
   warm: boolean;
+  /** The fingerprint path is offered: an empty password authenticates with the reader. */
+  fingerprint?: boolean;
   /** Terminal rows; the preview grows on tall terminals instead of scrolling a stub. */
   rows?: number;
   theme: DialogTheme;
@@ -140,6 +144,7 @@ export class ApprovalDialog implements Component, Focusable {
   readonly #requestRender: () => void;
   readonly #scroll: ScrollView;
   readonly #warm: boolean;
+  readonly #fingerprint: boolean;
   readonly #rows: number | undefined;
   readonly #note = new Input({
     prompt: "[ ",
@@ -165,6 +170,7 @@ export class ApprovalDialog implements Component, Focusable {
     this.#done = options.done;
     this.#requestRender = options.requestRender ?? (() => {});
     this.#warm = options.warm;
+    this.#fingerprint = options.fingerprint ?? false;
     this.#rows = options.rows;
     this.#reasonText = sanitizeForDisplay(options.reason);
     this.#errorText =
@@ -216,9 +222,19 @@ export class ApprovalDialog implements Component, Focusable {
       this.#errorText === undefined
         ? []
         : wrapTextWithAnsi(theme.fg("error", `sudo: ${this.#errorText}`), inner);
+    // The reader hint is wrapped at the same width the hint rows use, once, so
+    // the closed gate can reserve exactly the rows the open state will draw.
+    const readerLines =
+      this.#fingerprint && !this.#warm
+        ? wrapTextWithAnsi(
+            theme.fg("dim", HINT_FINGERPRINT),
+            Math.max(1, inner - COMMAND_INDENT.length),
+          )
+        : [];
+    const extraRows = (this.#warm ? 0 : 1) + readerLines.length;
     // Every row the preview does not own: borders, reason, command header,
-    // error, divider, options, the cold password row, the blank row above the
-    // footer, and the footer itself.
+    // error, divider, options, the cold password row (plus the reader hint
+    // above it), the blank row above the footer, and the footer itself.
     const reserved =
       2 +
       reasonLines.length +
@@ -226,7 +242,7 @@ export class ApprovalDialog implements Component, Focusable {
       1 +
       1 +
       OPTION_LABELS.length +
-      (this.#warm ? 0 : 1) +
+      extraRows +
       1 +
       1;
     const previewRows = Math.min(
@@ -265,21 +281,26 @@ export class ApprovalDialog implements Component, Focusable {
       // options and the password row are not drawn. Blank rows hold their place:
       // the closed gate is exactly as tall as the open one, so the centred
       // overlay does not jump when the last line arrives.
-      const blockRows = OPTION_LABELS.length + (this.#warm ? 0 : 1) + 1;
       const hint = wrapTextWithAnsi(
         theme.fg(this.#gateAlert ? "error" : "warning", HINT_READ),
         Math.max(1, inner - COMMAND_INDENT.length),
       );
-      const pad = Math.max(1, blockRows - 1 - hint.length - (this.#warm ? 0 : 1));
+      // Blank rows hold the places of the option block, the reader hint, and
+      // the password row: the closed gate is exactly as tall as the open one,
+      // so the centred overlay does not jump when the last line arrives.
+      const pad = Math.max(1, OPTION_LABELS.length - hint.length);
       lines.push(frameRow("", width));
       lines.push(...hint.map((line) => frameRow(`${COMMAND_INDENT}${line}`, width)));
       for (let row = 0; row < pad; row += 1) lines.push(frameRow("", width));
-      if (!this.#warm) lines.push(frameRow("", width));
+      for (let row = 0; row < extraRows; row += 1) lines.push(frameRow("", width));
       lines.push(frameRow(theme.fg("dim", HINT_READ_KEYS), width));
     } else {
       lines.push(...this.#optionLines(inner).map((line) => frameRow(line, width)));
       // A warm ticket makes sudo ignore any typed password, so no row at all.
       if (this.#choice !== NO_INDEX && !this.#warm) {
+        lines.push(
+          ...readerLines.map((line) => frameRow(`${COMMAND_INDENT}${line}`, width)),
+        );
         const prompt = theme.fg("error", PASSWORD_PROMPT);
         const [field = ""] = this.field.render(
           Math.max(1, inner - 2),
@@ -430,6 +451,12 @@ export class ApprovalDialog implements Component, Focusable {
     }
     const secret = this.field.take();
     if (secret.length === 0) {
+      // With the reader offered, an empty password is the fingerprint route:
+      // PAM authenticates with the reader, and a typed password is the fallback.
+      if (this.#fingerprint) {
+        this.#finish({ approved: true, mode, password: secret });
+        return;
+      }
       // An empty password cannot be approved, but denying on it would look like a
       // slip of the finger: keep the dialog open and mark the prompt instead.
       this.#passwordAlert = true;
@@ -477,7 +504,7 @@ export async function askApproval(
   ctx: ExtensionContext,
   command: string,
   reason: string,
-  options: { warm?: boolean; errorText?: string } = {},
+  options: { warm?: boolean; errorText?: string; fingerprint?: boolean } = {},
 ): Promise<ApprovalOutcome> {
   return ctx.ui.custom<ApprovalOutcome>(
     (tui, theme, _keybindings, done) => {
@@ -486,6 +513,7 @@ export async function askApproval(
         reason,
         errorText: options.errorText,
         warm: options.warm ?? false,
+        fingerprint: options.fingerprint,
         rows: overlayRows(tui),
         theme,
         done,

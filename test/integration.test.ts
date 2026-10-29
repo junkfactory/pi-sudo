@@ -574,10 +574,10 @@ describe("sudo_exec integration: warm, non-TUI, and hygiene", () => {
       assert.equal(calls.confirm, 0);
       assert.equal(records.length, 2, "one true probe and one approved run");
       assert.ok(records.every((record) => isWarm(record.args)));
-      assert.equal(records[0].args[records[0].args.length - 1], "exec 2>&1; true");
+      assert.equal(records[0].args[records[0].args.length - 1], "exec 2>&1 0</dev/null; true");
       assert.equal(
         records[1].args[records[1].args.length - 1],
-        "exec 2>&1; systemctl restart nginx",
+        "exec 2>&1 0</dev/null; systemctl restart nginx",
       );
       assert.match(textOf(result), /^\$ systemctl restart nginx\nexit code: 0/);
       assert.match(textOf(result), /active/);

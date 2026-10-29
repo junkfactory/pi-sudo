@@ -108,7 +108,7 @@ describe("executor", () => {
     assert.equal(rec.cmd, resolveSudo());
     assert.deepEqual(rec.args.slice(0, 4), ["-n", "-p", nonceFrom(rec.args), "--"]);
     assert.deepEqual(rec.args.slice(3), ["--", "/bin/sh", "-c", rec.args[6]]);
-    assert.equal(payloadFrom(rec.args), "exec 2>&1; id -u");
+    assert.equal(payloadFrom(rec.args), "exec 2>&1 0</dev/null; id -u");
     assert.equal(rec.opts.detached, false);
     assert.equal(rec.opts.env?.LC_ALL, "C");
     assert.deepEqual(rec.opts.stdio, ["pipe", "pipe", "pipe"]);
@@ -133,8 +133,8 @@ describe("executor", () => {
     assert.equal(rec.args[0], "-n");
     assert.equal(rec.args[1], "-p");
     assert.equal(rec.args[3], "--");
-    assert.deepEqual(rec.args.slice(4), ["/bin/sh", "-c", "exec 2>&1; true"]);
-    assert.equal(payloadFrom(rec.args), "exec 2>&1; true");
+    assert.deepEqual(rec.args.slice(4), ["/bin/sh", "-c", "exec 2>&1 0</dev/null; true"]);
+    assert.equal(payloadFrom(rec.args), "exec 2>&1 0</dev/null; true");
     assert.equal(rec.args.join(" ").includes("systemctl"), false);
     assert.equal(rec.opts.env?.LC_ALL, "C");
 
@@ -146,7 +146,7 @@ describe("executor", () => {
     const { records, spawnFn } = makeSpawn();
     const probe = probeTicket({ cwd: "/tmp", spawnFn });
     const rec = await nextSpawn(records);
-    assert.equal(payloadFrom(rec.args), "exec 2>&1; true");
+    assert.equal(payloadFrom(rec.args), "exec 2>&1 0</dev/null; true");
 
     // sudo's real prompt line, and the -p nonce never appeared: no secret exists.
     rec.child.stderr.emit("data", Buffer.from("sudo: a password is required\n"));
@@ -161,7 +161,7 @@ describe("executor", () => {
   it("cold run uses -S -p, writes the password once on the nonce, newline separately, then ends stdin", async () => {
     const { records, spawnFn } = makeSpawn();
     const password = Buffer.from(PASSWORD);
-    const run = runCold({ command: "id -u", cwd: "/tmp", password, spawnFn, noPromptMs: 1000 });
+    const run = runCold({ command: "id -u", cwd: "/tmp", password, spawnFn });
     const rec = await nextSpawn(records);
     const nonce = nonceFrom(rec.args);
 
@@ -170,7 +170,7 @@ describe("executor", () => {
     assert.equal(rec.opts.env?.LC_ALL, "C");
 
     const payload = payloadFrom(rec.args);
-    assert.equal(payload, "exec 2>&1; id -u");
+    assert.equal(payload, "exec 2>&1 0</dev/null; id -u");
 
     // The command's stderr now shares its stdout pipe.
     rec.child.stdout.emit("data", Buffer.from("command stderr\n"));
@@ -213,7 +213,7 @@ describe("executor", () => {
   it("zeroes the password on stdin finish, not before", async () => {
     const { records, spawnFn } = makeSpawn();
     const password = Buffer.from(PASSWORD);
-    const run = runCold({ command: "true", cwd: "/tmp", password, spawnFn, noPromptMs: 1000 });
+    const run = runCold({ command: "true", cwd: "/tmp", password, spawnFn });
     const rec = await nextSpawn(records);
 
     prompt(rec.child, nonceFrom(rec.args));
@@ -226,42 +226,181 @@ describe("executor", () => {
     assert.equal(outcome.status, "ran");
   });
 
-  it("ends stdin without writing when the prompt never appears; exit code classifies the result", async () => {
-    const first = makeSpawn();
-    const success = runCold({
-      command: "true",
-      cwd: "/tmp",
-      password: Buffer.from(PASSWORD),
-      spawnFn: first.spawnFn,
-      noPromptMs: 20,
-    });
-    const warmRec = await nextSpawn(first.records);
-    await tick(60);
-    assert.equal(warmRec.child.stdin.ended, true);
-    assert.equal(warmRec.child.stdin.writes.length, 0);
-    warmRec.child.finish(0);
-    const warmOutcome = await success;
-    assert.equal(warmOutcome.status, "ran");
-    assert.equal(warmOutcome.result.ok, true);
-    assert.equal(warmOutcome.result.warm, true);
-    assert.equal(warmOutcome.result.promptSeen, false);
+  it("an empty password spawns -S, writes nothing, ends stdin at once, and is not warm", async () => {
+    const { records, spawnFn } = makeSpawn();
+    const run = runCold({ command: "true", cwd: "/tmp", password: Buffer.alloc(0), spawnFn });
+    const rec = await nextSpawn(records);
 
-    const second = makeSpawn();
-    const failure = runCold({
+    // -S still applies: PAM authenticates with the fingerprint reader.
+    assert.equal(rec.args[0], "-S");
+    assert.equal(rec.child.stdin.ended, true, "the reader route needs no stdin");
+
+    // Even sudo's own prompt on stderr must not squeeze a write out of it.
+    prompt(rec.child, nonceFrom(rec.args));
+    assert.equal(rec.child.stdin.writes.length, 0);
+
+    rec.child.finish(0);
+    const outcome = await run;
+    assert.equal(outcome.status, "ran");
+    assert.equal(outcome.result.ok, true);
+    assert.equal(outcome.result.warm, false, "a fingerprint run is never reported warm");
+    assert.equal(outcome.result.promptSeen, false);
+  });
+
+  it("keeps stdin open when the prompt never appears; a failing exit gives no retry", async () => {
+    const { records, spawnFn } = makeSpawn();
+    const run = runCold({
       command: "false",
       cwd: "/tmp",
       password: Buffer.from(PASSWORD),
-      spawnFn: second.spawnFn,
-      noPromptMs: 20,
+      spawnFn,
     });
-    const coldRec = await nextSpawn(second.records);
+    const rec = await nextSpawn(records);
     await tick(60);
-    assert.equal(coldRec.child.stdin.writes.length, 0);
-    coldRec.child.finish(1);
-    const coldOutcome = await failure;
-    assert.equal(coldOutcome.status, "ran");
-    assert.equal(coldOutcome.result.ok, false);
-    assert.equal(coldOutcome.result.warm, false);
+    assert.equal(rec.child.stdin.ended, false);
+    assert.equal(rec.child.stdin.writes.length, 0);
+    rec.child.finish(1);
+    const outcome = await run;
+    assert.equal(outcome.status, "ran", "no retry without a real sudo prompt");
+    assert.equal(outcome.result.ok, false);
+    assert.equal(outcome.result.warm, false);
+  });
+
+  it("writes the password when the prompt arrives late", async () => {
+    const { records, spawnFn } = makeSpawn();
+    const run = runCold({
+      command: "true",
+      cwd: "/tmp",
+      password: Buffer.from(PASSWORD),
+      spawnFn,
+    });
+    const rec = await nextSpawn(records);
+    await tick(60);
+    prompt(rec.child, nonceFrom(rec.args));
+    assert.deepEqual(rec.child.stdin.writes, [Buffer.from(PASSWORD), "\n"]);
+    assert.equal(rec.child.stdin.ended, true);
+    rec.child.finish(0);
+    const outcome = await run;
+    assert.equal(outcome.status, "ran");
+    assert.equal(outcome.result.ok, true);
+    assert.equal(outcome.result.promptSeen, true);
+  });
+
+  it("prompts past the command timeout and still lets the command finish", async () => {
+    const { records, spawnFn } = makeSpawn();
+    const run = runCold({
+      command: "true",
+      cwd: "/tmp",
+      password: Buffer.from(PASSWORD),
+      spawnFn,
+      timeoutSec: 1,
+    });
+    const rec = await nextSpawn(records);
+    const nonce = nonceFrom(rec.args);
+    setTimeout(() => prompt(rec.child, nonce), 600);
+    setTimeout(() => rec.child.finish(0), 1400);
+    const outcome = await run;
+    assert.equal(outcome.status, "ran");
+    assert.equal(outcome.result.ok, true);
+    assert.equal(outcome.result.timedOut, false);
+    assert.equal(outcome.result.promptSeen, true);
+    assert.equal(rec.child.kills.includes("SIGTERM"), false);
+  });
+
+  describe("auth evidence", () => {
+    it("a fast prompt with the default threshold gives authEvidence:false and a small promptDelayMs", async () => {
+      const { records, spawnFn } = makeSpawn();
+      const run = runCold({
+        command: "true",
+        cwd: "/tmp",
+        password: Buffer.from(PASSWORD),
+        spawnFn,
+      });
+      const rec = await nextSpawn(records);
+      prompt(rec.child, nonceFrom(rec.args));
+      rec.child.finish(0);
+      const outcome = await run;
+      assert.equal(outcome.status, "ran");
+      assert.equal(outcome.result.authEvidence, false);
+      assert.equal(typeof outcome.result.promptDelayMs, "number");
+      assert.ok(outcome.result.promptDelayMs !== null);
+      assert.ok(outcome.result.promptDelayMs >= 0);
+      assert.ok(outcome.result.promptDelayMs < 5000);
+    });
+
+    it("a prompt beyond the slow-auth threshold gives authEvidence:true", async () => {
+      const { records, spawnFn } = makeSpawn();
+      const run = runCold({
+        command: "true",
+        cwd: "/tmp",
+        password: Buffer.from(PASSWORD),
+        spawnFn,
+        slowAuthMs: 20,
+      });
+      const rec = await nextSpawn(records);
+      await tick(60);
+      prompt(rec.child, nonceFrom(rec.args));
+      rec.child.finish(0);
+      const outcome = await run;
+      assert.equal(outcome.status, "ran");
+      assert.equal(outcome.result.authEvidence, true);
+      assert.ok(outcome.result.promptDelayMs !== null);
+      assert.ok(outcome.result.promptDelayMs >= 20);
+    });
+
+    it("a fingerprint marker on sudo's stdout before the prompt gives authEvidence:true", async () => {
+      const { records, spawnFn } = makeSpawn();
+      const run = runCold({
+        command: "true",
+        cwd: "/tmp",
+        password: Buffer.from(PASSWORD),
+        spawnFn,
+      });
+      const rec = await nextSpawn(records);
+      rec.child.stdout.emit("data", Buffer.from("Verification timed out\n"));
+      prompt(rec.child, nonceFrom(rec.args));
+      rec.child.finish(0);
+      const outcome = await run;
+      assert.equal(outcome.status, "ran");
+      assert.equal(outcome.result.authEvidence, true);
+      assert.ok(outcome.result.promptDelayMs !== null);
+    });
+
+    it("the same marker printed by the command after the prompt gives authEvidence:false", async () => {
+      const { records, spawnFn } = makeSpawn();
+      const run = runCold({
+        command: "printf 'Verification timed out\\n'",
+        cwd: "/tmp",
+        password: Buffer.from(PASSWORD),
+        spawnFn,
+      });
+      const rec = await nextSpawn(records);
+      prompt(rec.child, nonceFrom(rec.args));
+      rec.child.stdout.emit("data", Buffer.from("Verification timed out\n"));
+      rec.child.finish(0);
+      const outcome = await run;
+      assert.equal(outcome.status, "ran");
+      assert.equal(outcome.result.ok, true);
+      assert.equal(outcome.result.authEvidence, false);
+    });
+
+    it("a run without a prompt reports promptDelayMs:null and authEvidence:false", async () => {
+      const { records, spawnFn } = makeSpawn();
+      const run = runCold({
+        command: "false",
+        cwd: "/tmp",
+        password: Buffer.from(PASSWORD),
+        spawnFn,
+      });
+      const rec = await nextSpawn(records);
+      await tick(60);
+      rec.child.finish(1);
+      const outcome = await run;
+      assert.equal(outcome.status, "ran");
+      assert.equal(outcome.result.promptSeen, false);
+      assert.equal(outcome.result.promptDelayMs, null);
+      assert.equal(outcome.result.authEvidence, false);
+    });
   });
 
   it("ignores a nonce or password-required line written by the command itself", async () => {
@@ -271,7 +410,6 @@ describe("executor", () => {
       cwd: "/tmp",
       password: Buffer.from(PASSWORD),
       spawnFn: cold.spawnFn,
-      noPromptMs: 25,
     });
     const rec = await nextSpawn(cold.records);
     // The command writes the forged text to its own stderr, which is its stdout now.
@@ -328,7 +466,6 @@ describe("executor", () => {
       cwd: "/tmp",
       password: Buffer.from(PASSWORD),
       spawnFn: retryable.spawnFn,
-      noPromptMs: 1000,
     });
     const rec = await nextSpawn(retryable.records);
     prompt(rec.child, nonceFrom(rec.args));
@@ -344,7 +481,6 @@ describe("executor", () => {
       cwd: "/tmp",
       password: Buffer.from(PASSWORD),
       spawnFn: immediate.spawnFn,
-      noPromptMs: 1000,
     });
     const failRec = await nextSpawn(immediate.records);
     prompt(failRec.child, nonceFrom(failRec.args));
@@ -363,7 +499,6 @@ describe("executor", () => {
       cwd: "/tmp",
       password: Buffer.from(PASSWORD),
       spawnFn,
-      noPromptMs: 1000,
     });
     const rec = await nextSpawn(records);
     prompt(rec.child, nonceFrom(rec.args));

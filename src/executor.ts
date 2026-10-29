@@ -9,7 +9,6 @@ import { truncateTail } from "@earendil-works/pi-coding-agent";
 
 const RUN_DIR_PREFIX = "pi-sudo-";
 const DEFAULT_TIMEOUT_SEC = 120;
-const NO_PROMPT_MS = 5000;
 const KILL_GRACE_MS = 3000;
 const STDERR_SCAN_BYTES = 64 * 1024;
 /** Retained command output; a command past this is terminated rather than buffered. */
@@ -17,6 +16,8 @@ const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
 const CAPTURE_LIMIT_NOTE = "\n[output limit reached; the command was terminated]\n";
 const PASSWORD_REQUIRED = /^sudo: a password is required$/m;
 const RETRY_MESSAGE = "Sorry, try again.";
+const SLOW_AUTH_MS = 5000;
+const FINGERPRINT_MARKERS = /Verification timed out|Failed to match fingerprint/;
 
 export type SpawnFn = (command: string, args: string[], options: SpawnOptions) => ChildProcess;
 
@@ -53,13 +54,14 @@ export interface SpawnRunOptions {
   /** Live command stdout only; sudo's own stderr is never streamed. */
   onOutput?: (chunk: string) => void;
   spawnFn?: SpawnFn;
-  /** Test seam; production default is 5000 ms. */
-  noPromptMs?: number;
   /** Test seam; production default is 3000 ms. */
   killGraceMs?: number;
+  /** Test seam; production default is 5000 ms. */
+  slowAuthMs?: number;
 }
 
 export interface RunColdOptions extends SpawnRunOptions {
+  /** An empty buffer means no password; PAM authenticates (the fingerprint reader). */
   password: Buffer;
 }
 
@@ -73,6 +75,10 @@ export interface ExecResult {
   sudoStderr: string;
   truncated: boolean;
   fullOutputPath: string | null;
+  /** ms from spawn to sudo's password prompt; null when it never appeared. */
+  promptDelayMs: number | null;
+  /** The run itself showed evidence that a biometric module held PAM up. */
+  authEvidence: boolean;
   promptSeen: boolean;
   timedOut: boolean;
   aborted: boolean;
@@ -204,10 +210,11 @@ function makeNonce(): string {
 /**
  * The command's own stderr is merged into its stdout, so the stderr pipe carries
  * only sudo's messages. That keeps the nonce latch unspoofable without giving
- * root a pathname to reopen: no errfile, no symlink race.
+ * root a pathname to reopen: no errfile, no symlink race. The command must
+ * never inherit sudo's stdin pipe: with -S it carries the password.
  */
 function buildPayload(command: string): string {
-  return `exec 2>&1; ${command}`;
+  return `exec 2>&1 0</dev/null; ${command}`;
 }
 
 interface CollectArgs {
@@ -219,6 +226,8 @@ interface CollectArgs {
   startedAt: number;
   timedOut: boolean;
   aborted: boolean;
+  promptDelayMs: number | null;
+  authEvidence: boolean;
   promptSeen: boolean;
   warm: boolean;
   materialize: boolean;
@@ -255,6 +264,8 @@ async function collectResult(args: CollectArgs): Promise<ExecResult> {
     sudoStderr: args.sudoStderr,
     truncated: tail.truncated,
     fullOutputPath,
+    promptDelayMs: args.promptDelayMs,
+    authEvidence: args.authEvidence,
     promptSeen: args.promptSeen,
     timedOut: args.timedOut,
     aborted: args.aborted,
@@ -271,9 +282,13 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
     signal,
     onOutput,
     spawnFn = spawn,
-    noPromptMs = NO_PROMPT_MS,
     killGraceMs = KILL_GRACE_MS,
+    slowAuthMs = SLOW_AUTH_MS,
   } = options;
+
+  // An empty password is the fingerprint route: `-S` still applies (PAM asks
+  // the reader), but sudo's password prompt must never be answered with text.
+  const passwordOnly = password !== undefined && password.length > 0;
 
   const nonce = makeNonce();
   let child: ChildProcess;
@@ -304,21 +319,20 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
   let sudoStderr = "";
   let wroteOnce = false;
   let promptSeen = false;
+  let promptDelayMs: number | null = null;
+  let authStdout = '';
   let stdinEnded = false;
   let timedOut = false;
   let aborted = false;
   let settled = false;
   let zeroed = false;
   let timeoutTimer: NodeJS.Timeout | undefined;
-  let promptTimer: NodeJS.Timeout | undefined;
   let killTimer: NodeJS.Timeout | undefined;
 
   const clearTimers = (): void => {
     if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
-    if (promptTimer !== undefined) clearTimeout(promptTimer);
     if (killTimer !== undefined) clearTimeout(killTimer);
     timeoutTimer = undefined;
-    promptTimer = undefined;
     killTimer = undefined;
   };
 
@@ -370,6 +384,16 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
     killTimer.unref?.();
   };
 
+  // Authentication is not command time: give the command its full budget.
+  const armTimeout = (): void => {
+    if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+    timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      terminate();
+    }, Math.max(1, timeoutSec * 1000));
+    timeoutTimer.unref?.();
+  };
+
   const onAbort = (): void => {
     aborted = true;
     terminate();
@@ -397,14 +421,14 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
   child.stderr?.on("data", (chunk: Buffer | string) => {
     const text = chunk.toString();
     sudoStderr = (sudoStderr + text).slice(-STDERR_SCAN_BYTES);
-    if (password === undefined || wroteOnce || stdinEnded || timedOut || aborted) return;
+    if (!passwordOnly || wroteOnce || stdinEnded || timedOut || aborted) return;
     if (!sudoStderr.includes(nonce)) return;
     wroteOnce = true;
     promptSeen = true;
-    if (promptTimer !== undefined) {
-      clearTimeout(promptTimer);
-      promptTimer = undefined;
-    }
+    // The snapshot is taken before the command exists, so command output cannot fake it.
+    promptDelayMs = Date.now() - startedAt;
+    authStdout = stdout;
+    armTimeout();
     writeSecret();
   });
 
@@ -413,21 +437,10 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
     if (signal.aborted) onAbort();
   }
 
-  timeoutTimer = setTimeout(() => {
-    timedOut = true;
-    terminate();
-  }, Math.max(1, timeoutSec * 1000));
-  timeoutTimer.unref?.();
+  armTimeout();
 
-  if (password === undefined) {
+  if (password === undefined || password.length === 0) {
     endStdin();
-  } else {
-    promptTimer = setTimeout(() => {
-      promptTimer = undefined;
-      if (wroteOnce) return;
-      endStdin();
-    }, noPromptMs);
-    promptTimer.unref?.();
   }
 
   return await new Promise<InternalOutcome>((resolve, reject) => {
@@ -447,7 +460,11 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
       signal?.removeEventListener("abort", onAbort);
 
       const needsPassword = password === undefined && PASSWORD_REQUIRED.test(sudoStderr);
-      const warm = password === undefined || (!promptSeen && code === 0 && !timedOut && !aborted);
+      // A fingerprint run authenticated the user, but ran cold: it must never
+      // be reported warm, or the next call would skip the reader entirely.
+      const warm =
+        password === undefined ||
+        (passwordOnly && !promptSeen && code === 0 && !timedOut && !aborted);
 
       void collectResult({
         command,
@@ -458,6 +475,8 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
         startedAt,
         timedOut,
         aborted,
+        promptDelayMs,
+        authEvidence: (promptDelayMs ?? 0) >= slowAuthMs || FINGERPRINT_MARKERS.test(authStdout),
         promptSeen,
         warm,
         materialize: !needsPassword,

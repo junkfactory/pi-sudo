@@ -18,7 +18,7 @@ import extension, {
   type SudoExecDetails,
 } from "../src/index.js";
 import type { SpawnFn } from "../src/executor.js";
-import type { ApprovalOutcome } from "../src/dialog.js";
+import type { ApprovalDialog, ApprovalOutcome } from "../src/dialog.js";
 
 const DENIAL_TEXT =
   "The user denied this sudo request; nothing ran. Do not retry the same command. Explain to the user why root was needed and propose a safer non-privileged alternative if one exists.";
@@ -141,10 +141,19 @@ function makeHarness(): Harness {
   return { tools, commands, handlers };
 }
 
+/** The dialog factory askApproval hands to ctx.ui.custom, captured by the tests. */
+type DialogCapture = (
+  tui: unknown,
+  theme: unknown,
+  keybindings: unknown,
+  done: (value: unknown) => void,
+) => unknown;
+
 interface CtxCalls {
   custom: number;
   confirm: number;
   notify: Array<[string, string | undefined]>;
+  dialogs: DialogCapture[];
 }
 
 function makeCtx(options: {
@@ -156,12 +165,13 @@ function makeCtx(options: {
   /** Stands in for `ctx.ui.custom`, e.g. to answer the escalation dialog. */
   onCustom?: () => Promise<unknown>;
 } = {}): { ctx: ExtensionToolContext; calls: CtxCalls } {
-  const calls: CtxCalls = { custom: 0, confirm: 0, notify: [] };
+  const calls: CtxCalls = { custom: 0, confirm: 0, notify: [], dialogs: [] };
   const answers = options.answers ?? [];
   let answerIndex = 0;
   const ui = {
-    custom: async () => {
+    custom: async (render?: unknown) => {
       calls.custom += 1;
+      calls.dialogs.push(render as DialogCapture);
       if (options.onCustom !== undefined) return options.onCustom();
       return answers[answerIndex++];
     },
@@ -195,6 +205,18 @@ function executeTool(
   reason = "test reason",
 ): Promise<ToolResult> {
   return tool.execute("call-1", { command, reason }, undefined, undefined, ctx);
+}
+
+/** Build the captured approval dialog so its render output can be asserted. */
+function realizeDialog(capture: DialogCapture): ApprovalDialog {
+  const tui = { terminal: { rows: 40 }, requestRender() {} };
+  const theme = { fg: (_color: string, text: string) => text };
+  return capture(tui, theme, {}, () => {}) as ApprovalDialog;
+}
+
+/** The rendered dialog text, checked for the reader-hint wording. */
+function dialogText(capture: DialogCapture): string {
+  return realizeDialog(capture).render(120).join("\n");
 }
 
 function nonceFrom(args: string[]): string {
@@ -552,10 +574,10 @@ describe("sudo_exec approval lifetime", () => {
       assert.deepEqual(
         records.map((record) => payloadFrom(record.args)),
         [
-          "exec 2>&1; true",
-          "exec 2>&1; systemctl restart nginx",
-          "exec 2>&1; true",
-          "exec 2>&1; systemctl restart nginx",
+          "exec 2>&1 0</dev/null; true",
+          "exec 2>&1 0</dev/null; systemctl restart nginx",
+          "exec 2>&1 0</dev/null; true",
+          "exec 2>&1 0</dev/null; systemctl restart nginx",
         ],
       );
       assert.equal(
@@ -589,7 +611,7 @@ describe("sudo_exec approval lifetime", () => {
       assert.equal(second.details.warm, true);
       assert.equal(records.length, 3, "one probe, one approved run, one silent run");
       assert.equal(records[2].args[0], "-n");
-      assert.equal(payloadFrom(records[2].args), "exec 2>&1; systemctl restart nginx");
+      assert.equal(payloadFrom(records[2].args), "exec 2>&1 0</dev/null; systemctl restart nginx");
       assert.equal(
         records.some((record) => record.args.includes("-k")),
         false,
@@ -665,7 +687,7 @@ describe("sudo_exec approval lifetime", () => {
       assert.equal(calls.custom, 1);
       assert.equal(records.length, 1, "only the true probe may spawn");
       assert.equal(records[0].args[0], "-n");
-      assert.equal(payloadFrom(records[0].args), "exec 2>&1; true");
+      assert.equal(payloadFrom(records[0].args), "exec 2>&1 0</dev/null; true");
     } finally {
       setSudoSpawnFn(undefined);
     }
@@ -699,7 +721,7 @@ describe("sudo_exec approval lifetime", () => {
       );
       assert.equal(calls.custom, 1);
       assert.equal(records.length, 1, "only the warm probe may spawn");
-      assert.equal(payloadFrom(records[0].args), "exec 2>&1; true");
+      assert.equal(payloadFrom(records[0].args), "exec 2>&1 0</dev/null; true");
     } finally {
       setSudoSpawnFn(undefined);
     }
@@ -904,6 +926,213 @@ describe("global mutex", () => {
       assert.equal(records.length, 0);
     } finally {
       resolveDialog({ approved: false, note: "" });
+      setSudoSpawnFn(undefined);
+    }
+  });
+});
+
+describe("fingerprint learning", () => {
+  // The learned record is module-level and shared with every test above; those
+  // runs leave it untouched, so the ordered tests below start from nothing and
+  // build on each other deliberately.
+  type Step = (child: FakeChild, args: string[]) => void;
+
+  function makeSequence(
+    steps: Step[],
+  ): { records: SpawnRecord[]; spawnFn: SpawnFn } {
+    let index = 0;
+    return makeSpawn((child, args) => {
+      setTimeout(() => {
+        // A session_start handler spawns sudo -k between the tool calls.
+        if (args[0] === "-k") {
+          child.emit("close", 0, null);
+          return;
+        }
+        const step = steps[index];
+        index += 1;
+        if (step !== undefined) step(child, args);
+        else child.emit("close", 0, null);
+      }, 0);
+    });
+  }
+
+  const passwordRequired: Step = (child) => {
+    child.stderr.emit("data", Buffer.from("sudo: a password is required\n"));
+    child.emit("close", 1, null);
+  };
+  /** sudo's stdout carries a biometric marker before the prompt ever appears. */
+  const coldWithMarker: Step = (child, args) => {
+    child.stdout.emit("data", Buffer.from("Verification timed out\n"));
+    child.stderr.emit("data", Buffer.from(nonceFrom(args)));
+    child.emit("close", 0, null);
+  };
+  const coldOk: Step = (child, args) => {
+    child.stderr.emit("data", Buffer.from(nonceFrom(args)));
+    child.emit("close", 0, null);
+  };
+  const coldEmptyOk: Step = (child) => {
+    child.emit("close", 0, null);
+  };
+  const coldNoPasswordProvided: Step = (child) => {
+    child.stderr.emit("data", Buffer.from("sudo: no password was provided\n"));
+    child.emit("close", 1, null);
+  };
+  const coldRetry: Step = (child, args) => {
+    child.stderr.emit("data", Buffer.from(`${nonceFrom(args)}Sorry, try again.\n`));
+    child.emit("close", 1, null);
+  };
+
+  async function startSession(harness: Harness, reason: string): Promise<void> {
+    const handler = harness.handlers.get("session_start")?.[0];
+    assert.ok(handler !== undefined, "session_start handler is registered");
+    const { ctx } = makeCtx();
+    await handler({ type: "session_start", reason }, ctx);
+  }
+
+  it("learns the reader from a password run whose child shows biometric evidence", async () => {
+    const { records, spawnFn } = makeSequence([
+      passwordRequired,
+      coldWithMarker,
+      passwordRequired,
+      coldOk,
+    ]);
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx, calls } = makeCtx({ answers: [once("hunter2"), once("hunter2")] });
+
+      const first = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(first.isError, false);
+      assert.equal(first.details.auth, "password");
+      assert.equal(first.details.warm, false, "an authenticated cold run is never warm");
+      assert.equal(dialogText(calls.dialogs[0]).includes("fingerprint reader"), false,
+        "nothing is learned before the first evidence");
+
+      const second = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(second.isError, false);
+      assert.equal(second.details.auth, "password");
+      assert.equal(dialogText(calls.dialogs[1]).includes("fingerprint reader"), true,
+        "the next dialog offers the reader");
+      assert.equal(records[1].args[0], "-S");
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+
+  it("runs an empty answer with -S, writes nothing, and reports the fingerprint route", async () => {
+    const { records, spawnFn } = makeSequence([passwordRequired, coldEmptyOk]);
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx, calls } = makeCtx({ answers: [once("")] });
+
+      const result = await executeTool(tool, ctx, "systemctl restart nginx");
+
+      assert.equal(result.isError, false);
+      assert.equal(records[0].args[0], "-n");
+      assert.equal(records[1].args[0], "-S");
+      assert.equal(records[1].child.stdin.writes.length, 0);
+      assert.equal(records[1].child.stdin.ended, true);
+      assert.equal(result.details.auth, "fingerprint");
+      assert.equal(result.details.warm, false);
+      assert.equal(result.details.approval, "once");
+      // The reader hint is still offered while the record is held.
+      assert.equal(dialogText(calls.dialogs[0]).includes("fingerprint reader"), true);
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+
+  it("rejects the reader after a failed empty answer and returns the fixed text", async () => {
+    const { records, spawnFn } = makeSequence([
+      passwordRequired,
+      coldNoPasswordProvided,
+      passwordRequired,
+      coldEmptyOk,
+    ]);
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx, calls } = makeCtx({ answers: [once(""), once("")] });
+
+      const first = await executeTool(tool, ctx, "systemctl restart nginx");
+
+      assert.equal(first.isError, true);
+      assert.match(textOf(first), /^Fingerprint authentication did not succeed and no password was typed; nothing ran\./);
+      assert.ok(textOf(first).includes("touch the reader when it asks."));
+      assert.equal(first.details.attempts, 1, "the empty route runs once, with no dialog loop");
+      assert.equal(records[1].args[0], "-S");
+      assert.equal(records[1].child.stdin.writes.length, 0);
+
+      const second = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(second.isError, false);
+      assert.equal(dialogText(calls.dialogs[1]).includes("fingerprint reader"), false,
+        "the rejected reader is no longer offered");
+      assert.equal(second.details.auth, "fingerprint");
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+
+  it("keeps the learned reader across a session switch and drops the rejection", async () => {
+    const { spawnFn } = makeSequence([
+      passwordRequired,
+      coldNoPasswordProvided,
+      passwordRequired,
+      coldEmptyOk,
+    ]);
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx, calls } = makeCtx({ answers: [once(""), once("")] });
+
+      // Re-establish a rejection: the dialog must not offer the reader now.
+      const before = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(before.isError, true);
+      assert.equal(dialogText(calls.dialogs[0]).includes("fingerprint reader"), false);
+
+      await startSession(harness, "resume");
+
+      const after = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(after.isError, false);
+      assert.equal(dialogText(calls.dialogs[1]).includes("fingerprint reader"), true,
+        "the learned record survives the session; the rejection does not");
+      assert.equal(after.details.auth, "fingerprint");
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+
+  it("never offers the hint on a retry dialog after an error", async () => {
+    const { spawnFn } = makeSequence([
+      passwordRequired,
+      coldRetry,
+      coldOk,
+    ]);
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx, calls } = makeCtx({ answers: [once("bad"), once("good")] });
+
+      const result = await executeTool(tool, ctx, "systemctl restart nginx");
+
+      assert.equal(result.isError, false);
+      assert.equal(result.details.attempts, 2);
+      assert.equal(dialogText(calls.dialogs[0]).includes("fingerprint reader"), true,
+        "the first dialog still offers the learned reader");
+      assert.equal(dialogText(calls.dialogs[1]).includes("fingerprint reader"), false,
+        "the retry dialog shows the sudo error, not the reader");
+    } finally {
       setSudoSpawnFn(undefined);
     }
   });

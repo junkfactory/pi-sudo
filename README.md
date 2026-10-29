@@ -40,7 +40,7 @@ Three choices: `Yes, once` (the default), `Yes, until sudo asks again`, and `No`
 
 The preview is 10 to 24 lines, sized to the terminal. A command too long for it hides the options until you reach the last line: the footer reads `You must read the full command to make a decision: scroll to the bottom.` above the scroll keys, and blank rows hold the options' place so the frame keeps its size. `End` jumps to the last line, `shift+↑/↓` pages.
 
-Esc denies the request. Enter with an empty password does not: the `Password:` label turns red and the dialog waits, so a stray Enter cannot throw away the request. A denial runs nothing: the pre-dialog probe runs only `true` as root, to learn whether sudo will prompt, so your command never starts before you approve it. The denial returns an error result that tells the model not to retry the same command and to explain why root was needed.
+Esc denies the request. Without the fingerprint hint, Enter on an empty password does not: the `Password:` label turns red and the dialog waits, so a stray Enter cannot throw away the request. With the hint it approves a PAM-only run — see [Fingerprint and other PAM delays](#fingerprint-and-other-pam-delays). A denial runs nothing: the pre-dialog probe runs only `true` as root, to learn whether sudo will prompt, so your command never starts before you approve it. The denial returns an error result that tells the model not to retry the same command and to explain why root was needed.
 
 A wrong password reopens the dialog with sudo's error, up to three attempts; only sudo's `Sorry, try again.` is retried.
 
@@ -76,9 +76,25 @@ Approval belongs to the extension; lifetime belongs to sudo. Every `sudo_exec` a
 
 pi-sudo never sets, shortens, or extends sudo's ticket. The measured window, why a session switch needs its own `sudo -k`, and the risk that ticket mode carries are in [DESIGN.md](./DESIGN.md#approval-versus-lifetime).
 
+### Fingerprint and other PAM delays
+
+On this machine `pam_fprintd` sits above `pam_unix` as `auth sufficient`, with `timeout=30` and `max-tries=3`. An untouched reader therefore costs about 30 s once: the verify times out and `pam_unix` asks for the password, and the run goes on as before. `max-tries` counts wrong-finger matches only, not timeouts.
+
+pi-sudo covers this with a fingerprint hint. In a cold dialog with the hint, Enter on an empty password approves a PAM-only run: sudo starts with `-S` and an empty stdin, so no text is ever sent and PAM authenticates whichever way the stack offers — here, the reader. Without the hint, Enter on an empty password still turns the `Password:` label red and the dialog waits.
+
+The typed-password fallback still works: type the password and press Enter. If you touch the reader when it asks, PAM authenticates first, sudo's prompt never appears, and the typed password is never written — the buffer is zeroed when the run ends. If you do not, `pam_unix` asks after about 30 s, and the password is then written and used as before.
+
+pi-sudo learns the whole thing from the run itself; the first cold run after pi started shows no hint. The run tells pi-sudo that a biometric module held PAM up (a prompt delay of five seconds or more, or a fingerprint marker in the output snapshot at the prompt), and the next cold dialog shows the hint and accepts the empty password. The record lives in the pi process only: it resets when pi exits, or when the extension is reloaded.
+
+When the machine's PAM offers no reader, the empty-password run fails fast with `no password was provided`: sudo was given nothing it could authenticate with, the command did not run, and the dialog does not reopen. The hint disappears then, until the next session change; the next dialog asks for the typed password again.
+
+While PAM holds a cold run, a status line — `waiting for sudo authentication: fingerprint reader or password prompt` — appears after three seconds of silence. It goes to the status stream only, never into the result the model sees.
+
+The fix for the wait is on the root side, and it is yours: `pam_fprintd.so timeout=5 max-tries=1` in your PAM stack shortens the wait for a reader you touch reliably. That is a deliberate change to your own PAM configuration, chosen and applied by you; pi-sudo never edits files outside its repository and never spawns a probe program to sniff the reader.
+
 ## Design and limits
 
-[`DESIGN.md`](./DESIGN.md) explains how the password path, the probe, the escalation gate, and the bash guard work, and lists the guarantees and the boundaries that are intentional for this version. Read the boundaries before relying on the tool: other extensions can see keystrokes, a root command can print a fake prompt, the bash guard is a nudge, path checks are heuristic, and the ticket window is sudo's to choose.
+[`DESIGN.md`](./DESIGN.md) explains how the password path, the probe, the fingerprint hint, the escalation gate, and the bash guard work, and lists the guarantees and the boundaries that are intentional for this version. Read the boundaries before relying on the tool: other extensions can see keystrokes, a root command can print a fake prompt, the bash guard is a nudge, path checks are heuristic, and the ticket window is sudo's to choose.
 
 ## Running the tests
 

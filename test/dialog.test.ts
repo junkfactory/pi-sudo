@@ -31,7 +31,7 @@ interface Harness {
 function harness(
   command: string,
   reason = "free disk space",
-  options: { warm?: boolean } = {},
+  options: { warm?: boolean; fingerprint?: boolean } = {},
 ): Harness {
   let settled = false;
   let result: ApprovalOutcome | undefined;
@@ -39,6 +39,7 @@ function harness(
     command,
     reason,
     warm: options.warm ?? false,
+    fingerprint: options.fingerprint,
     theme: plainTheme,
     done: (value) => {
       settled = true;
@@ -483,6 +484,81 @@ describe("ApprovalDialog (warm ticket)", () => {
     h.dialog.handleInput(ESC);
     assert.equal(h.settled(), true);
     assert.deepEqual(h.result(), { approved: false, note: "" });
+  });
+});
+
+describe("ApprovalDialog (fingerprint)", () => {
+  it("shows the reader hint only when cold and flagged", () => {
+    const offered = plain(harness("id", "free disk space", { fingerprint: true }).dialog.render(WIDTH).join("\n"));
+    assert.ok(offered.includes("empty password: authenticate with the"), offered);
+    assert.ok(offered.includes("fingerprint"), offered);
+    // Wrapping may split the sentence, so only the stable prefix is asserted.
+    assert.ok(offered.includes("fallback if the reader"), offered);
+    assert.ok(offered.includes("Password:"), offered);
+  });
+
+  it("renders no reader hint without the flag or when the ticket is warm", () => {
+    const cold = plain(harness("id").dialog.render(WIDTH).join("\n"));
+    assert.equal(cold.includes("fingerprint"), false, cold);
+    const warm = plain(
+      harness("id", "free disk space", { warm: true, fingerprint: true }).dialog.render(WIDTH).join("\n"),
+    );
+    assert.equal(warm.includes("fingerprint"), false, warm);
+  });
+
+  it("approves with an empty password on Enter when the reader is offered", () => {
+    const h = harness("id", "free disk space", { fingerprint: true });
+    h.dialog.handleInput(ENTER);
+    assert.equal(h.settled(), true);
+    assert.deepEqual(h.result(), {
+      approved: true,
+      mode: "once",
+      password: Buffer.alloc(0),
+    });
+  });
+
+  it("keeps the red-prompt alert on an empty Enter without the reader flag", () => {
+    const marked: DialogTheme = {
+      fg: (color, text) => (color === "error" ? `[E]${text}` : text),
+    };
+    let result: ApprovalOutcome | undefined;
+    const dialog = createApprovalDialog({
+      command: "id",
+      reason: "root",
+      warm: false,
+      fingerprint: false,
+      theme: marked,
+      done: (value) => {
+        result = value;
+      },
+    });
+    const text = (): string => dialog.render(WIDTH).map(plain).join("\n");
+    dialog.render(WIDTH);
+    dialog.handleInput(ENTER);
+    assert.equal(result, undefined, "an empty password must not deny");
+    assert.ok(text().includes("[E]Password: "), "the prompt turns red");
+    dialog.handleInput(ESC);
+    assert.deepEqual(result, { approved: false, note: "" });
+  });
+
+  it("keeps the closed gate exactly as tall as the open state, with and without the reader hint", () => {
+    const command = `echo ${"needle ".repeat(200)}`;
+    for (const fingerprint of [false, true]) {
+      const growth = harness(command, "free disk space", { fingerprint });
+      const gatedHeight = growth.dialog.render(WIDTH).length;
+      growth.dialog.handleInput(END);
+      assert.equal(
+        growth.dialog.render(WIDTH).length,
+        gatedHeight,
+        `no growth when the options appear (fingerprint: ${fingerprint})`,
+      );
+      const open = growth.dialog.render(WIDTH).map(plain).join("\n");
+      assert.equal(
+        open.includes("fingerprint") === fingerprint,
+        true,
+        `the reader hint matches the flag (fingerprint: ${fingerprint})`,
+      );
+    }
   });
 });
 
