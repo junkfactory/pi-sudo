@@ -35,10 +35,18 @@ const ATTEMPTS_TEXT =
   "sudo rejected the password 3 times; the command was not executed and nothing else ran. Do not retry this call blindly: confirm with the user that they entered the right password and that the account can use sudo, then try again if needed.";
 const FINGERPRINT_FAILED_TEXT =
   "Fingerprint authentication did not succeed and no password was typed; nothing ran. sudo may not accept this reader. Call sudo_exec again and type the sudo password, or touch the reader when it asks.";
-const AUTH_WAIT_TEXT =
-  "\n[pi-sudo] waiting for sudo authentication: fingerprint reader or password prompt\n";
+/** Cold run, reader not yet learned: promise nothing beyond authentication. */
+const AUTH_WAIT_TEXT = "\n[pi-sudo] waiting for sudo authentication\n";
+/** Cold run on a machine recorded as waiting for a reader. */
+const AUTH_WAIT_READER_TEXT =
+  "\n[pi-sudo] waiting for sudo authentication: touch the fingerprint reader, or wait for the password prompt\n";
 /** How long a cold run waits without output before the status line explains the wait. */
 const AUTH_WAIT_MS = 3000;
+
+/** The wait note only ever promises the reader once a run recorded it. UI only. */
+export function authWaitText(showReader: boolean): string {
+  return showReader ? AUTH_WAIT_READER_TEXT : AUTH_WAIT_TEXT;
+}
 /** sudo's verdict when it was offered nothing to authenticate with. */
 const NO_PASSWORD_PROVIDED = "no password was provided";
 
@@ -585,7 +593,7 @@ export default function (pi: ExtensionAPI) {
               : setTimeout(() => {
                   if (sawCommandOutput) return;
                   onUpdate({
-                    content: [{ type: "text", text: AUTH_WAIT_TEXT }],
+                    content: [{ type: "text", text: authWaitText(showReader) }],
                     details: details({ attempts, policyChecked }),
                   });
                 }, AUTH_WAIT_MS);
@@ -625,6 +633,15 @@ export default function (pi: ExtensionAPI) {
           }
           // The run itself is the only honest witness to a biometric delay.
           readerLearned = readerLearned || result.authEvidence;
+          // A cold run that never prompted authenticated without the password: the
+          // probe had just proved sudo wanted one, so PAM used a biometric or a
+          // smartcard (Touch ID never prints a marker, and it can be touched at
+          // once). The command's own exit code is irrelevant to that fact.
+          const authenticatedWithoutPrompt = !result.promptSeen && !result.timedOut && !result.aborted;
+          if (authenticatedWithoutPrompt) readerLearned = true;
+          // Fresh proof also clears an earlier empty-answer rejection: the module
+          // is still in the stack, so nothing runs before a touch.
+          if (result.authEvidence || authenticatedWithoutPrompt) readerRejected = false;
           if (outcome.status === "ran") {
             return execResult(result, attempts, policyChecked, answer.mode, "password");
           }

@@ -11,6 +11,7 @@ import type {
   ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import extension, {
+  authWaitText,
   isEscalation,
   needsSudoApproval,
   pathTokens,
@@ -428,6 +429,21 @@ describe("pathTokens", () => {
       resolve(cwd, "src/x.ts"),
     ]);
     assert.deepEqual(pathTokens("git status", cwd), []);
+  });
+});
+
+describe("auth wait note", () => {
+  it("promises only authentication until the reader has been learned", () => {
+    const neutral = authWaitText(false);
+    assert.ok(neutral.includes("waiting for sudo authentication"));
+    assert.equal(neutral.includes("fingerprint"), false,
+      "a cold run must not promise a reader it has not seen");
+  });
+
+  it("names the reader once the record exists", () => {
+    const reader = authWaitText(true);
+    assert.ok(reader.includes("touch the fingerprint reader"));
+    assert.ok(reader.includes("wait for the password prompt"));
   });
 });
 
@@ -973,6 +989,10 @@ describe("fingerprint learning", () => {
   const coldEmptyOk: Step = (child) => {
     child.emit("close", 0, null);
   };
+  /** A cold run that never prompts: PAM authenticated some other way, then the command failed. */
+  const coldNoPromptFail: Step = (child) => {
+    child.emit("close", 1, null);
+  };
   const coldNoPasswordProvided: Step = (child) => {
     child.stderr.emit("data", Buffer.from("sudo: no password was provided\n"));
     child.emit("close", 1, null);
@@ -1132,6 +1152,72 @@ describe("fingerprint learning", () => {
         "the first dialog still offers the learned reader");
       assert.equal(dialogText(calls.dialogs[1]).includes("fingerprint reader"), false,
         "the retry dialog shows the sudo error, not the reader");
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+
+  it("re-offers the reader after a typed run shows the delay again", async () => {
+    const { spawnFn } = makeSequence([
+      passwordRequired,
+      coldNoPasswordProvided,
+      passwordRequired,
+      coldWithMarker,
+      passwordRequired,
+      coldOk,
+    ]);
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx, calls } = makeCtx({ answers: [once(""), once("hunter2"), once("hunter2")] });
+
+      const rejected = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(rejected.isError, true, "the empty answer established the rejection");
+
+      const typed = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(typed.isError, false);
+      assert.equal(dialogText(calls.dialogs[1]).includes("fingerprint reader"), false,
+        "the rejected reader is still withheld while the rejection stands");
+
+      const after = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(after.isError, false);
+      assert.equal(dialogText(calls.dialogs[2]).includes("fingerprint reader"), true,
+        "the delay seen on the typed run cleared the rejection");
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+
+  it("learns from a cold run that never prompted, even when the command fails", async () => {
+    const { spawnFn } = makeSequence([
+      passwordRequired,
+      coldNoPasswordProvided,
+      passwordRequired,
+      coldNoPromptFail,
+      passwordRequired,
+      coldOk,
+    ]);
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx, calls } = makeCtx({ answers: [once(""), once("hunter2"), once("hunter2")] });
+
+      const rejected = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(rejected.isError, true, "the empty answer established the rejection");
+
+      const touched = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(touched.isError, true, "the command failed; the authentication still stands");
+      assert.equal(dialogText(calls.dialogs[1]).includes("fingerprint reader"), false,
+        "the rejection was still in force while that dialog was open");
+
+      const after = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(after.isError, false);
+      assert.equal(dialogText(calls.dialogs[2]).includes("fingerprint reader"), true,
+        "a cold run that never prompted cleared the rejection without a marker or delay");
     } finally {
       setSudoSpawnFn(undefined);
     }

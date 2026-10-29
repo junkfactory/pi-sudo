@@ -65,10 +65,15 @@ Rows 1 to 7 are the release gate and map to the acceptance items used for the la
 | 24 | Empty Enter     | Cold run with the fingerprint hint; press Enter on an empty field, touch the reader only when it asks | The run succeeds on touch only: without a touch it fails with the fingerprint-failure text, nothing ran, and the dialog does not reopen                                                                                                 |
 | 25 | No reader       | A machine whose PAM stack has no biometric module; press Enter on an empty password                   | Fast failure with `no password was provided`; nothing ran, and no further dialog in the session offers the fingerprint hint until the session changes                                                                                   |
 | 26 | stdin isolation | Ask for `sudo_exec cat`                                                                               | Exit 0: the payload redirects the command stdin from `/dev/null`, so `cat` sees EOF and does not hang on sudo stdin pipe                                                                                                                |
+| 27 | macOS cold0     | macOS + `pam_tid`: fresh pi, `/sudo-forget`, cold run; type the password, submit, touch at once       | Touch ID authenticates without sudo prompting, so the typed password is never written. That prompt-less run records the reader, so the next cold dialog shows the hint                                                                  |
+| 28 | macOS hint      | `/sudo-forget`, then a cold run with the hint shown; Enter on an empty field, then touch              | Approved on touch alone: sudo never prompts, nothing is written, `auth: "fingerprint"`. From here a cold run costs one touch, not a typed password                                                                                      |
+| 29 | macOS rejected  | Same hint state: press Enter on an empty field and do not touch the reader                            | Touch ID waits for an action and never times out, so press Esc. sudo reads EOF, reports `no password was provided`, nothing ran, and the hint is withdrawn until the session changes                                                    |
 
 ## Notes from the last full run
 
 pi 1.4.0, sudo 1.9.17p2, Arch, user in `wheel`, `timestamp_type=tty`, `timestamp_timeout=5` minutes. All rows passed.
+
+Rows 27–29 were run on macOS 27.2 (`pam_tid` enabled through `/etc/pam.d/sudo_local`, sudo's stock stack otherwise) against the fingerprint-hint build. All three passed: the first cold run authenticated by touch without prompting and recorded the reader, the next cold dialog showed the hint and approved an empty password on touch alone with `auth: "fingerprint"`, and dismissing Touch ID with Esc produced `no password was provided` with nothing run. Note for that last row: `pam_tid` does not time out on its own, so a user who neither touches nor presses Esc waits forever — the delay evidence is real PAM latency, but its end is a user action.
 
 Two findings worth keeping:
 
