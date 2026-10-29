@@ -46,6 +46,9 @@ function harness(
       result = value;
     },
   });
+  // pi renders the dialog before it can take input, and the read gate is
+  // measured by that render, so every harness starts from a rendered frame.
+  dialog.render(WIDTH);
   return { dialog, settled: () => settled, result: () => result };
 }
 
@@ -559,6 +562,43 @@ describe("ApprovalDialog (fingerprint)", () => {
         `the reader hint matches the flag (fingerprint: ${fingerprint})`,
       );
     }
+  });
+
+  it("keeps the frame height at a narrow width where the hint wraps past the options", () => {
+    const command = `echo ${"needle ".repeat(200)}`;
+    for (const fingerprint of [false, true]) {
+      const narrow = harness(command, "free disk space", { fingerprint });
+      const gatedHeight = narrow.dialog.render(30).length;
+      narrow.dialog.handleInput(END);
+      assert.equal(
+        narrow.dialog.render(30).length,
+        gatedHeight,
+        `no growth when the options appear at 30 columns (fingerprint: ${fingerprint})`,
+      );
+    }
+  });
+
+  it("re-checks the read gate when the password field submits without Enter", () => {
+    const h = harness(`echo ${"needle ".repeat(200)}`);
+    h.dialog.render(WIDTH);
+    // A CR inside a chunk reaches onSubmit through the field, not handleInput.
+    h.dialog.field.handleInput("x\r");
+    assert.equal(h.settled(), false, "an unread command must not be approved");
+  });
+
+  it("does not approve before the first render has measured the preview", () => {
+    let settled = false;
+    const dialog = createApprovalDialog({
+      command: `echo ${"needle ".repeat(200)}`,
+      reason: "free disk space",
+      warm: false,
+      theme: plainTheme,
+      done: () => {
+        settled = true;
+      },
+    });
+    dialog.handleInput(ENTER);
+    assert.equal(settled, false, "the gate fails closed before a render");
   });
 });
 

@@ -79,6 +79,8 @@ export interface ExecResult {
   promptDelayMs: number | null;
   /** The run itself showed evidence that a biometric module held PAM up. */
   authEvidence: boolean;
+  /** A fingerprint module's own message appeared before sudo's prompt. */
+  authMarker: boolean;
   promptSeen: boolean;
   timedOut: boolean;
   aborted: boolean;
@@ -228,6 +230,7 @@ interface CollectArgs {
   aborted: boolean;
   promptDelayMs: number | null;
   authEvidence: boolean;
+  authMarker: boolean;
   promptSeen: boolean;
   warm: boolean;
   materialize: boolean;
@@ -266,6 +269,7 @@ async function collectResult(args: CollectArgs): Promise<ExecResult> {
     fullOutputPath,
     promptDelayMs: args.promptDelayMs,
     authEvidence: args.authEvidence,
+    authMarker: args.authMarker,
     promptSeen: args.promptSeen,
     timedOut: args.timedOut,
     aborted: args.aborted,
@@ -320,7 +324,7 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
   let wroteOnce = false;
   let promptSeen = false;
   let promptDelayMs: number | null = null;
-  let authStdout = '';
+  let authStdout = "";
   let stdinEnded = false;
   let timedOut = false;
   let aborted = false;
@@ -466,6 +470,7 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
         password === undefined ||
         (passwordOnly && !promptSeen && code === 0 && !timedOut && !aborted);
 
+      const authMarker = FINGERPRINT_MARKERS.test(authStdout);
       void collectResult({
         command,
         stdout,
@@ -476,7 +481,8 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
         timedOut,
         aborted,
         promptDelayMs,
-        authEvidence: (promptDelayMs ?? 0) >= slowAuthMs || FINGERPRINT_MARKERS.test(authStdout),
+        authEvidence: (promptDelayMs ?? 0) >= slowAuthMs || authMarker,
+        authMarker,
         promptSeen,
         warm,
         materialize: !needsPassword,

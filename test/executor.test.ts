@@ -344,6 +344,7 @@ describe("executor", () => {
       const outcome = await run;
       assert.equal(outcome.status, "ran");
       assert.equal(outcome.result.authEvidence, true);
+      assert.equal(outcome.result.authMarker, false, "a slow prompt is not a marker");
       assert.ok(outcome.result.promptDelayMs !== null);
       assert.ok(outcome.result.promptDelayMs >= 20);
     });
@@ -363,6 +364,7 @@ describe("executor", () => {
       const outcome = await run;
       assert.equal(outcome.status, "ran");
       assert.equal(outcome.result.authEvidence, true);
+      assert.equal(outcome.result.authMarker, true, "the marker alone is recorded");
       assert.ok(outcome.result.promptDelayMs !== null);
     });
 
@@ -382,6 +384,7 @@ describe("executor", () => {
       assert.equal(outcome.status, "ran");
       assert.equal(outcome.result.ok, true);
       assert.equal(outcome.result.authEvidence, false);
+      assert.equal(outcome.result.authMarker, false);
     });
 
     it("a run without a prompt reports promptDelayMs:null and authEvidence:false", async () => {

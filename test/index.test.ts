@@ -15,6 +15,7 @@ import extension, {
   isEscalation,
   needsSudoApproval,
   pathTokens,
+  readerEvidence,
   setSudoSpawnFn,
   type SudoExecDetails,
 } from "../src/index.js";
@@ -444,6 +445,65 @@ describe("auth wait note", () => {
     const reader = authWaitText(true);
     assert.ok(reader.includes("touch the fingerprint reader"));
     assert.ok(reader.includes("wait for the password prompt"));
+  });
+});
+
+describe("reader evidence", () => {
+  const quiet = {
+    promptSeen: false,
+    timedOut: false,
+    aborted: false,
+    signal: null,
+    sudoStderr: "",
+    authEvidence: false,
+    authMarker: false,
+  } as const;
+
+  it("treats a clean prompt-less run as proof in both directions", () => {
+    assert.deepEqual(readerEvidence({ ...quiet }), { learned: true, clearsRejection: true });
+  });
+
+  it("refuses to learn from sudo's own diagnostics", () => {
+    const result = readerEvidence({ ...quiet, sudoStderr: "sudo: not in the sudoers file\n" });
+    assert.deepEqual(result, { learned: false, clearsRejection: false });
+  });
+
+  it("refuses to learn from a killed, timed-out, or aborted run", () => {
+    for (const result of [
+      { ...quiet, signal: "SIGTERM" as NodeJS.Signals },
+      { ...quiet, timedOut: true },
+      { ...quiet, aborted: true },
+    ]) {
+      assert.deepEqual(readerEvidence(result), { learned: false, clearsRejection: false });
+    }
+  });
+
+  it("learns from a marker and clears the rejection with it", () => {
+    const result = readerEvidence({
+      ...quiet,
+      promptSeen: true,
+      authEvidence: true,
+      authMarker: true,
+    });
+    assert.deepEqual(result, { learned: true, clearsRejection: true });
+  });
+
+  it("learns from a delay but does not clear the rejection on it", () => {
+    // A slow non-biometric PAM (LDAP/SSSD) must not re-offer the reader forever.
+    const result = readerEvidence({
+      ...quiet,
+      promptSeen: true,
+      authEvidence: true,
+      authMarker: false,
+    });
+    assert.deepEqual(result, { learned: true, clearsRejection: false });
+  });
+
+  it("learns nothing from a prompt with no evidence", () => {
+    assert.deepEqual(readerEvidence({ ...quiet, promptSeen: true }), {
+      learned: false,
+      clearsRejection: false,
+    });
   });
 });
 
@@ -986,6 +1046,11 @@ describe("fingerprint learning", () => {
     child.stderr.emit("data", Buffer.from(nonceFrom(args)));
     child.emit("close", 0, null);
   };
+  /** A cold run that never prompted but failed before authenticating. */
+  const coldNoPromptDiagnostic: Step = (child) => {
+    child.stderr.emit("data", Buffer.from("sudo: not in the sudoers file\n"));
+    child.emit("close", 1, null);
+  };
   const coldEmptyOk: Step = (child) => {
     child.emit("close", 0, null);
   };
@@ -1218,6 +1283,38 @@ describe("fingerprint learning", () => {
       assert.equal(after.isError, false);
       assert.equal(dialogText(calls.dialogs[2]).includes("fingerprint reader"), true,
         "a cold run that never prompted cleared the rejection without a marker or delay");
+    } finally {
+      setSudoSpawnFn(undefined);
+    }
+  });
+
+  it("does not clear the rejection for a prompt-less run that sudo refused", async () => {
+    const { spawnFn } = makeSequence([
+      passwordRequired,
+      coldNoPasswordProvided,
+      passwordRequired,
+      coldNoPromptDiagnostic,
+      passwordRequired,
+      coldOk,
+    ]);
+    setSudoSpawnFn(spawnFn);
+    try {
+      const harness = makeHarness();
+      const tool = harness.tools.get("sudo_exec");
+      assert.ok(tool !== undefined);
+      const { ctx, calls } = makeCtx({ answers: [once(""), once("hunter2"), once("hunter2")] });
+
+      const rejected = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(rejected.isError, true, "the empty answer established the rejection");
+
+      const refused = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(refused.isError, true, "sudo refused before authenticating");
+      assert.match(textOf(refused), /not in the sudoers file/);
+
+      const after = await executeTool(tool, ctx, "systemctl restart nginx");
+      assert.equal(after.isError, false);
+      assert.equal(dialogText(calls.dialogs[2]).includes("fingerprint reader"), false,
+        "a sudo policy error is not proof that a reader answered");
     } finally {
       setSudoSpawnFn(undefined);
     }

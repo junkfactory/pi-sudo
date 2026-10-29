@@ -36,6 +36,14 @@ function innerWidth(width: number): number {
   return Math.max(MIN_INNER, width - FRAME_CHROME);
 }
 
+/** Caps wrapped rows, marking the cut so text is never dropped without a sign. */
+function capRows(lines: string[], rows: number): string[] {
+  if (lines.length <= rows) return lines;
+  const kept = lines.slice(0, Math.max(1, rows - 1));
+  const last = (kept[kept.length - 1] ?? "").replace(/\s+$/, "");
+  return [...kept.slice(0, -1), `${last}…`];
+}
+
 /** Pads with spaces to `width`; the caller truncates anything longer first. */
 function padToWidth(text: string, width: number): string {
   const pad = width - visibleWidth(text);
@@ -161,7 +169,7 @@ export class ApprovalDialog implements Component, Focusable {
   #gateAlert = false;
   /** An empty-password Enter turns the prompt red instead of denying the request. */
   #passwordAlert = false;
-  #sawEnd = true;
+  #sawEnd = false;
   #closed = false;
 
   constructor(options: ApprovalDialogOptions) {
@@ -224,13 +232,15 @@ export class ApprovalDialog implements Component, Focusable {
         : wrapTextWithAnsi(theme.fg("error", `sudo: ${this.#errorText}`), inner);
     // The reader hint is wrapped at the same width the hint rows use, once, so
     // the closed gate can reserve exactly the rows the open state will draw.
-    const readerLines =
+    const readerLines = capRows(
       this.#fingerprint && !this.#warm
         ? wrapTextWithAnsi(
             theme.fg("dim", HINT_FINGERPRINT),
             Math.max(1, inner - COMMAND_INDENT.length),
           )
-        : [];
+        : [],
+      OPTION_LABELS.length,
+    );
     const extraRows = (this.#warm ? 0 : 1) + readerLines.length;
     // Every row the preview does not own: borders, reason, command header,
     // error, divider, options, the cold password row (plus the reader hint
@@ -281,14 +291,18 @@ export class ApprovalDialog implements Component, Focusable {
       // options and the password row are not drawn. Blank rows hold their place:
       // the closed gate is exactly as tall as the open one, so the centred
       // overlay does not jump when the last line arrives.
-      const hint = wrapTextWithAnsi(
-        theme.fg(this.#gateAlert ? "error" : "warning", HINT_READ),
-        Math.max(1, inner - COMMAND_INDENT.length),
+      const hint = capRows(
+        wrapTextWithAnsi(
+          theme.fg(this.#gateAlert ? "error" : "warning", HINT_READ),
+          Math.max(1, inner - COMMAND_INDENT.length),
+        ),
+        OPTION_LABELS.length,
       );
-      // Blank rows hold the places of the option block, the reader hint, and
-      // the password row: the closed gate is exactly as tall as the open one,
-      // so the centred overlay does not jump when the last line arrives.
-      const pad = Math.max(1, OPTION_LABELS.length - hint.length);
+      // The blank rows hold the places of the option block, the reader hint, and
+      // the password row: with every block capped at the options' height, the
+      // closed gate is exactly as tall as the open one, so the centred overlay
+      // does not jump when the last line arrives.
+      const pad = Math.max(0, OPTION_LABELS.length - hint.length);
       lines.push(frameRow("", width));
       lines.push(...hint.map((line) => frameRow(`${COMMAND_INDENT}${line}`, width)));
       for (let row = 0; row < pad; row += 1) lines.push(frameRow("", width));
@@ -440,6 +454,13 @@ export class ApprovalDialog implements Component, Focusable {
   }
 
   #submit(): void {
+    if (!this.#sawEnd) {
+      // The field can submit on a CR inside a chunk without the Enter handler,
+      // so the read gate is re-checked here rather than only in handleInput.
+      this.#gateAlert = true;
+      this.#requestRender();
+      return;
+    }
     if (this.#choice === NO_INDEX) {
       this.#finish({ approved: false, note: sanitizeNote(this.#note.getValue()) });
       return;

@@ -153,7 +153,7 @@ interface DialogDrive {
   hold?: Promise<void>;
 }
 
-type DialogComponent = { handleInput(data: string): void };
+type DialogComponent = { handleInput(data: string): void; render?(width: number): string[] };
 
 type DialogFactory = (
   tui: { requestRender(): void; terminal: { rows: number } },
@@ -193,6 +193,9 @@ function makeCtx(options: CtxOptions = {}): { ctx: ExtensionToolContext; calls: 
           done,
         );
         void (async () => {
+          // pi renders every dialog before it can take input; the read gate is
+          // measured by that render, so the drive does it too.
+          component.render?.(100);
           if (drive.hold !== undefined) await drive.hold;
           if (drive.emptySubmit === true) {
             component.handleInput("\r");

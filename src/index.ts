@@ -49,6 +49,8 @@ export function authWaitText(showReader: boolean): string {
 }
 /** sudo's verdict when it was offered nothing to authenticate with. */
 const NO_PASSWORD_PROVIDED = "no password was provided";
+/** sudo speaking for itself, before any command runs: policy, PAM, or config. */
+const SUDO_DIAGNOSTIC = /^sudo: /m;
 
 const SUDO_GUARD_REASON =
   "`sudo` needs an interactive password prompt, which bash cannot provide here. Use the sudo_exec tool with the command itself (no leading sudo).";
@@ -339,6 +341,30 @@ let spawnImpl: SpawnFn = spawn;
 // not; both die with the process or an extension reload.
 let readerLearned = false;
 let readerRejected = false;
+
+/**
+ * What one cold run proves about the machine's PAM stack. `learned` accepts the
+ * delay as evidence; `clearsRejection` needs proof that the reader answered — a
+ * fingerprint marker, or a run that never needed a password — so a slow
+ * non-biometric PAM cannot loop between a wrong hint and a failed empty run.
+ */
+export function readerEvidence(
+  result: Pick<ExecResult, "promptSeen" | "timedOut" | "aborted" | "signal" | "sudoStderr" | "authEvidence" | "authMarker">,
+): { learned: boolean; clearsRejection: boolean } {
+  // The probe just proved sudo wants a password, so a run that never prompted
+  // authenticated some other way. sudo's own diagnostics mean it never got that
+  // far, and a signalled child proves nothing at all.
+  const authenticatedWithoutPrompt =
+    !result.promptSeen &&
+    !result.timedOut &&
+    !result.aborted &&
+    result.signal === null &&
+    !SUDO_DIAGNOSTIC.test(result.sudoStderr);
+  return {
+    learned: result.authEvidence || authenticatedWithoutPrompt,
+    clearsRejection: result.authMarker || authenticatedWithoutPrompt,
+  };
+}
 let permissionServiceImpl:
   | ((sessionId: string) => PermissionsService | undefined)
   | undefined;
@@ -373,7 +399,9 @@ export default function (pi: ExtensionAPI) {
     // The user's own terminal keeps its own, separate ticket.
     if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
       ticketGranted = false;
-      // A new session may run on another machine: ask the reader again.
+      // A rejection is transient — the empty answer may have been a slip, or a
+      // touch that was cancelled — so a session change clears it. `readerLearned`
+      // is a machine fact and survives the switch.
       readerRejected = false;
       await forgetTicket(spawnImpl).catch(() => {});
     }
@@ -632,16 +660,9 @@ export default function (pi: ExtensionAPI) {
             return execResult(result, attempts, policyChecked, answer.mode, "fingerprint");
           }
           // The run itself is the only honest witness to a biometric delay.
-          readerLearned = readerLearned || result.authEvidence;
-          // A cold run that never prompted authenticated without the password: the
-          // probe had just proved sudo wanted one, so PAM used a biometric or a
-          // smartcard (Touch ID never prints a marker, and it can be touched at
-          // once). The command's own exit code is irrelevant to that fact.
-          const authenticatedWithoutPrompt = !result.promptSeen && !result.timedOut && !result.aborted;
-          if (authenticatedWithoutPrompt) readerLearned = true;
-          // Fresh proof also clears an earlier empty-answer rejection: the module
-          // is still in the stack, so nothing runs before a touch.
-          if (result.authEvidence || authenticatedWithoutPrompt) readerRejected = false;
+          const evidence = readerEvidence(result);
+          readerLearned = readerLearned || evidence.learned;
+          if (evidence.clearsRejection) readerRejected = false;
           if (outcome.status === "ran") {
             return execResult(result, attempts, policyChecked, answer.mode, "password");
           }
