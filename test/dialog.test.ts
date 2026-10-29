@@ -131,7 +131,7 @@ describe("ApprovalDialog", () => {
   it("draws a bordered frame titled with the request title at a fixed width", () => {
     const { dialog } = harness("id");
     const lines = dialog.render(WIDTH).map(plain);
-    assert.ok(lines[0].includes("\u03c0 sudo: Requesting root privilege"), lines[0]);
+    assert.ok(lines[0].includes("\u03c0 sudo \u00b7 request root privilege"), lines[0]);
     assert.ok(lines[0].startsWith("\u256d\u2500"), lines[0]);
     // The dash run must reach the corner: a space there reads as a broken line.
     assert.ok(lines[0].endsWith("\u2500\u256e"), JSON.stringify(lines[0]));
@@ -227,7 +227,7 @@ describe("ApprovalDialog", () => {
       lines.slice(readAt, readAt + 3).join(" ").includes("scroll to the bottom"),
       "the hint must ask for a scroll to the bottom",
     );
-    assert.equal(keysAt, readAt + 4, "two blank rows and the password slot sit above the footer");
+    assert.equal(keysAt, readAt + 5, "the blank rows and the password slot sit above the footer");
     assert.equal(lines[keysAt + 1].startsWith("╰"), true);
     // Opening the gate must not resize the frame, on its own dialog so the scroll
     // position of this one stays where the assertions below expect it.
@@ -492,22 +492,31 @@ describe("ApprovalDialog (warm ticket)", () => {
 });
 
 describe("ApprovalDialog (fingerprint)", () => {
-  it("shows the reader hint only when cold and flagged", () => {
+  it("puts the biometric route on the password label only when cold and flagged", () => {
     const offered = plain(harness("id", "free disk space", { fingerprint: true }).dialog.render(WIDTH).join("\n"));
-    assert.ok(offered.includes("empty password: authenticate with the"), offered);
-    assert.ok(offered.includes("fingerprint"), offered);
-    // Wrapping may split the sentence, so only the stable prefix is asserted.
-    assert.ok(offered.includes("fallback if the reader"), offered);
-    assert.ok(offered.includes("Password:"), offered);
+    assert.ok(offered.includes("Password: (enter for biometric)"), offered);
+    const typed = plain(harness("id").dialog.render(WIDTH).join("\n"));
+    assert.ok(typed.includes("Password: (enter password)"), typed);
+    assert.equal(typed.includes("biometric"), false, typed);
   });
 
-  it("renders no reader hint without the flag or when the ticket is warm", () => {
+  it("drops the placeholder once something has been typed", () => {
+    const h = harness("id", "free disk space", { fingerprint: true });
+    h.dialog.handleInput("h");
+    const text = plain(h.dialog.render(WIDTH).join("\n"));
+    assert.ok(text.includes("Password:"), text);
+    assert.equal(text.includes("enter for biometric"), false, text);
+    h.dialog.handleInput(ESC);
+  });
+
+  it("renders no biometric placeholder when the flag is absent or the ticket is warm", () => {
     const cold = plain(harness("id").dialog.render(WIDTH).join("\n"));
-    assert.equal(cold.includes("fingerprint"), false, cold);
+    assert.equal(cold.includes("biometric"), false, cold);
     const warm = plain(
       harness("id", "free disk space", { warm: true, fingerprint: true }).dialog.render(WIDTH).join("\n"),
     );
-    assert.equal(warm.includes("fingerprint"), false, warm);
+    assert.equal(warm.includes("biometric"), false, warm);
+    assert.equal(warm.includes("Password:"), false, warm);
   });
 
   it("approves with an empty password on Enter when the reader is offered", () => {
@@ -545,7 +554,7 @@ describe("ApprovalDialog (fingerprint)", () => {
     assert.deepEqual(result, { approved: false, note: "" });
   });
 
-  it("keeps the closed gate exactly as tall as the open state, with and without the reader hint", () => {
+  it("keeps the closed gate exactly as tall as the open state, with and without the biometric route", () => {
     const command = `echo ${"needle ".repeat(200)}`;
     for (const fingerprint of [false, true]) {
       const growth = harness(command, "free disk space", { fingerprint });
@@ -558,9 +567,9 @@ describe("ApprovalDialog (fingerprint)", () => {
       );
       const open = growth.dialog.render(WIDTH).map(plain).join("\n");
       assert.equal(
-        open.includes("fingerprint") === fingerprint,
+        open.includes("enter for biometric") === fingerprint,
         true,
-        `the reader hint matches the flag (fingerprint: ${fingerprint})`,
+        `the placeholder matches the flag (fingerprint: ${fingerprint})`,
       );
     }
   });
@@ -583,10 +592,7 @@ describe("ApprovalDialog (fingerprint)", () => {
   it("marks a hint it had to cap, instead of silently dropping the tail", () => {
     const h = harness(`echo ${"needle ".repeat(200)}`, "free disk space", { fingerprint: true });
     const gated = h.dialog.render(30).map(plain).join("\n");
-    h.dialog.handleInput(END);
-    const open = h.dialog.render(30).map(plain).join("\n");
     assert.ok(gated.includes("…"), "the closed gate marks the cut");
-    assert.ok(open.includes("…"), "the wrapped hint marks the cut");
   });
 
   it("fits a short terminal instead of overflowing the overlay budget", () => {

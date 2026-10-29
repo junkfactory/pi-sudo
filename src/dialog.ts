@@ -16,7 +16,7 @@ export type DialogTheme = Pick<Theme, "fg">;
 const MAX_PREVIEW_LINES = 10;
 const COMMAND_INDENT = "  ";
 /** Frame title shown above the command preview. */
-const TITLE = "\u03c0 sudo: Requesting root privilege";
+const TITLE = "\u03c0 sudo \u00b7 request root privilege";
 const REASON_LABEL = "Reason: ";
 const COMMAND_LABEL = "Command:";
 const DENIAL_PLACEHOLDER = "enter reason for denial (optional)";
@@ -26,8 +26,6 @@ const HINT_READ =
   "You must read the full command to make a decision: scroll to the bottom.";
 const HINT_READ_KEYS = "shift+↑↓ scroll · PgUp/PgDn · End · esc deny";
 const HINT_KEYS = "↑↓ navigate · enter confirm · esc deny";
-const HINT_FINGERPRINT =
-  "empty password: authenticate with the fingerprint reader · typed password: fallback if the reader times out";
 
 /** Columns taken by the frame itself: "│ " + " │". */
 const FRAME_CHROME = 4;
@@ -224,22 +222,13 @@ export class ApprovalDialog implements Component, Focusable {
     const inner = innerWidth(width);
     const previewWidth = Math.max(1, inner - COMMAND_INDENT.length);
     const content = this.#scroll.render(previewWidth);
-    // The reader hint is wrapped at the same width the hint rows use, once, so
-    // the closed gate can reserve exactly the rows the open state will draw.
-    const readerWidth = Math.max(1, inner - COMMAND_INDENT.length);
-    const readerLines = capRows(
-      this.#fingerprint && !this.#warm
-        ? wrapTextWithAnsi(theme.fg("dim", HINT_FINGERPRINT), readerWidth)
-        : [],
-      OPTION_LABELS.length,
-      readerWidth,
-    );
-    const extraRows = (this.#warm ? 0 : 1) + readerLines.length;
-    // Every row the scroll view does not own: borders, divider, options, the
-    // cold password row (plus the reader hint above it), the blank row above the
-    // footer, and the footer itself. Reasoning and sudo errors scroll with the
-    // command, so a long one can never push the options off the screen.
-    const reserved = 2 + 1 + OPTION_LABELS.length + extraRows + 1 + 1;
+    // The cold password block is a blank row plus the password row; the blank keeps
+    // the label off the option list. Every row the scroll view does not own:
+    // borders, the blank above the divider, the divider, the options, that block,
+    // the blank above the footer, and the footer. The reason and sudo's errors
+    // scroll with the command, so a long one can never push the options off screen.
+    const extraRows = this.#warm ? 0 : 2;
+    const reserved = 2 + 1 + 1 + OPTION_LABELS.length + extraRows + 1 + 1;
     // A short terminal must not be over-budget: the preview shrinks to one row
     // instead of forcing ten, so the overlay never clips the footer or border.
     const previewRows = Math.min(
@@ -269,6 +258,8 @@ export class ApprovalDialog implements Component, Focusable {
     for (const line of content.slice(top, top + previewRows)) {
       lines.push(frameRow(`${COMMAND_INDENT}${line}`, width));
     }
+    // One blank row keeps the command block off the divider and the options.
+    lines.push(frameRow("", width));
     // The divider is drawn in both states so the frame does not change shape
     // when the gate opens.
     lines.push(divider(width));
@@ -298,16 +289,18 @@ export class ApprovalDialog implements Component, Focusable {
       lines.push(frameRow(theme.fg("dim", `${HINT_READ_KEYS}${range}`), width));
     } else {
       lines.push(...this.#optionLines(inner).map((line) => frameRow(line, width)));
-      // A warm ticket makes sudo ignore any typed password, so no row at all.
+      // A warm ticket makes sudo ignore any typed password, so no block at all.
       if (this.#choice !== NO_INDEX && !this.#warm) {
-        lines.push(
-          ...readerLines.map((line) => frameRow(`${COMMAND_INDENT}${line}`, width)),
-        );
-        const prompt = theme.fg("error", PASSWORD_PROMPT);
-        const [field = ""] = this.field.render(
-          Math.max(1, inner - 2),
-          this.#passwordAlert ? prompt : undefined,
-        );
+        lines.push(frameRow("", width));
+        const label = this.#passwordAlert
+          ? theme.fg("error", PASSWORD_PROMPT)
+          : PASSWORD_PROMPT;
+        // The hint is a placeholder: it says what Enter would do, and goes away
+        // once something has been typed.
+        const hint = this.field.empty
+          ? theme.fg("dim", `(${this.#fingerprint ? "enter for biometric" : "enter password"})`)
+          : "";
+        const [field = ""] = this.field.render(Math.max(1, inner - 2), `${label}${hint}`);
         lines.push(frameRow(`${COMMAND_INDENT}${field}`, width));
       }
       // A blank row keeps the footer from crowding the options.
@@ -420,8 +413,10 @@ export class ApprovalDialog implements Component, Focusable {
    */
   #scrollContent(width: number): string[] {
     const theme = this.#theme;
+    // The reason is context, not the thing being approved: dim it so the command
+    // keeps the brightest ink in the frame.
     const head = wrapTextWithAnsi(
-      `${theme.fg("dim", REASON_LABEL)}${this.#reasonText}`,
+      theme.fg("dim", `${REASON_LABEL}${this.#reasonText}`),
       width,
     );
     const error =

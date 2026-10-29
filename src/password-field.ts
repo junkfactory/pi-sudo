@@ -1,4 +1,4 @@
-import { CURSOR_MARKER, renderFakeCursor, truncateToWidth } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, renderFakeCursor, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Component, Focusable } from "@earendil-works/pi-tui";
 
 export const PASSWORD_PROMPT = "Password: ";
@@ -80,6 +80,11 @@ export class PasswordField implements Component, Focusable {
 
   get focused(): boolean {
     return this.#focused;
+  }
+
+  /** True while nothing has been typed, so the prompt can show a placeholder hint. */
+  get empty(): boolean {
+    return this.#bytes.length === 0;
   }
 
   set focused(value: boolean) {
@@ -168,7 +173,8 @@ export class PasswordField implements Component, Focusable {
 
   render(width: number, prompt: string = PROMPT): string[] {
     const n = codePoints(this.#bytes);
-    const room = Math.max(1, width - PROMPT.length - 2);
+    // Measure the actual prompt: callers may append a dim placeholder hint.
+    const room = Math.max(1, width - visibleWidth(prompt) - 2);
     const bullets = BULLET.repeat(Math.min(n, room)) + (n > room ? ELLIPSIS : "");
     const cursor = this.#focused ? CURSOR_MARKER + renderFakeCursor(" ") : "";
     return [truncateToWidth(`${prompt}${bullets}${cursor}`, width)];

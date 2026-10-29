@@ -1092,13 +1092,13 @@ describe("fingerprint learning", () => {
       assert.equal(first.isError, false);
       assert.equal(first.details.auth, "password");
       assert.equal(first.details.warm, false, "an authenticated cold run is never warm");
-      assert.equal(dialogText(calls.dialogs[0]).includes("fingerprint reader"), false,
+      assert.equal(dialogText(calls.dialogs[0]).includes("biometric"), false,
         "nothing is learned before the first evidence");
 
       const second = await executeTool(tool, ctx, "systemctl restart nginx");
       assert.equal(second.isError, false);
       assert.equal(second.details.auth, "password");
-      assert.equal(dialogText(calls.dialogs[1]).includes("fingerprint reader"), true,
+      assert.equal(dialogText(calls.dialogs[1]).includes("biometric"), true,
         "the next dialog offers the reader");
       assert.equal(records[1].args[0], "-S");
     } finally {
@@ -1126,7 +1126,7 @@ describe("fingerprint learning", () => {
       assert.equal(result.details.warm, false);
       assert.equal(result.details.approval, "once");
       // The reader hint is still offered while the record is held.
-      assert.equal(dialogText(calls.dialogs[0]).includes("fingerprint reader"), true);
+      assert.equal(dialogText(calls.dialogs[0]).includes("biometric"), true);
     } finally {
       setSudoSpawnFn(undefined);
     }
@@ -1157,7 +1157,7 @@ describe("fingerprint learning", () => {
 
       const second = await executeTool(tool, ctx, "systemctl restart nginx");
       assert.equal(second.isError, false);
-      assert.equal(dialogText(calls.dialogs[1]).includes("fingerprint reader"), false,
+      assert.equal(dialogText(calls.dialogs[1]).includes("biometric"), false,
         "the rejected reader is no longer offered");
       assert.equal(second.details.auth, "fingerprint");
     } finally {
@@ -1182,13 +1182,13 @@ describe("fingerprint learning", () => {
       // Re-establish a rejection: the dialog must not offer the reader now.
       const before = await executeTool(tool, ctx, "systemctl restart nginx");
       assert.equal(before.isError, true);
-      assert.equal(dialogText(calls.dialogs[0]).includes("fingerprint reader"), false);
+      assert.equal(dialogText(calls.dialogs[0]).includes("biometric"), false);
 
       await startSession(harness, "resume");
 
       const after = await executeTool(tool, ctx, "systemctl restart nginx");
       assert.equal(after.isError, false);
-      assert.equal(dialogText(calls.dialogs[1]).includes("fingerprint reader"), true,
+      assert.equal(dialogText(calls.dialogs[1]).includes("biometric"), true,
         "the learned record survives the session; the rejection does not");
       assert.equal(after.details.auth, "fingerprint");
     } finally {
@@ -1213,9 +1213,9 @@ describe("fingerprint learning", () => {
 
       assert.equal(result.isError, false);
       assert.equal(result.details.attempts, 2);
-      assert.equal(dialogText(calls.dialogs[0]).includes("fingerprint reader"), true,
+      assert.equal(dialogText(calls.dialogs[0]).includes("biometric"), true,
         "the first dialog still offers the learned reader");
-      assert.equal(dialogText(calls.dialogs[1]).includes("fingerprint reader"), false,
+      assert.equal(dialogText(calls.dialogs[1]).includes("biometric"), false,
         "the retry dialog shows the sudo error, not the reader");
     } finally {
       setSudoSpawnFn(undefined);
@@ -1243,12 +1243,12 @@ describe("fingerprint learning", () => {
 
       const typed = await executeTool(tool, ctx, "systemctl restart nginx");
       assert.equal(typed.isError, false);
-      assert.equal(dialogText(calls.dialogs[1]).includes("fingerprint reader"), false,
+      assert.equal(dialogText(calls.dialogs[1]).includes("biometric"), false,
         "the rejected reader is still withheld while the rejection stands");
 
       const after = await executeTool(tool, ctx, "systemctl restart nginx");
       assert.equal(after.isError, false);
-      assert.equal(dialogText(calls.dialogs[2]).includes("fingerprint reader"), true,
+      assert.equal(dialogText(calls.dialogs[2]).includes("biometric"), true,
         "the marker seen on the typed run cleared the rejection");
     } finally {
       setSudoSpawnFn(undefined);
@@ -1276,12 +1276,12 @@ describe("fingerprint learning", () => {
 
       const touched = await executeTool(tool, ctx, "systemctl restart nginx");
       assert.equal(touched.isError, true, "the command failed; the authentication still stands");
-      assert.equal(dialogText(calls.dialogs[1]).includes("fingerprint reader"), false,
+      assert.equal(dialogText(calls.dialogs[1]).includes("biometric"), false,
         "the rejection was still in force while that dialog was open");
 
       const after = await executeTool(tool, ctx, "systemctl restart nginx");
       assert.equal(after.isError, false);
-      assert.equal(dialogText(calls.dialogs[2]).includes("fingerprint reader"), true,
+      assert.equal(dialogText(calls.dialogs[2]).includes("biometric"), true,
         "a cold run that never prompted cleared the rejection without a marker or delay");
     } finally {
       setSudoSpawnFn(undefined);
@@ -1313,7 +1313,7 @@ describe("fingerprint learning", () => {
 
       const after = await executeTool(tool, ctx, "systemctl restart nginx");
       assert.equal(after.isError, false);
-      assert.equal(dialogText(calls.dialogs[2]).includes("fingerprint reader"), false,
+      assert.equal(dialogText(calls.dialogs[2]).includes("biometric"), false,
         "a sudo policy error is not proof that a reader answered");
     } finally {
       setSudoSpawnFn(undefined);
