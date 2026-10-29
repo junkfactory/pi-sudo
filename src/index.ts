@@ -344,9 +344,10 @@ let readerRejected = false;
 
 /**
  * What one cold run proves about the machine's PAM stack. `learned` accepts the
- * delay as evidence; `clearsRejection` needs proof that the reader answered — a
- * fingerprint marker, or a run that never needed a password — so a slow
- * non-biometric PAM cannot loop between a wrong hint and a failed empty run.
+ * delay as evidence; `clearsRejection` needs proof that a biometric or smartcard
+ * module is present — a fingerprint marker, or a run that never needed a
+ * password — so a slow non-biometric PAM cannot loop between a wrong hint and a
+ * failed empty run.
  */
 export function readerEvidence(
   result: Pick<ExecResult, "promptSeen" | "timedOut" | "aborted" | "signal" | "sudoStderr" | "authEvidence" | "authMarker">,

@@ -368,6 +368,24 @@ describe("executor", () => {
       assert.ok(outcome.result.promptDelayMs !== null);
     });
 
+    it("a fingerprint marker on sudo's stderr before the prompt also counts", async () => {
+      const { records, spawnFn } = makeSpawn();
+      const run = runCold({
+        command: "true",
+        cwd: "/tmp",
+        password: Buffer.from(PASSWORD),
+        spawnFn,
+      });
+      const rec = await nextSpawn(records);
+      rec.child.stderr.emit("data", Buffer.from("Verification timed out\n"));
+      prompt(rec.child, nonceFrom(rec.args));
+      rec.child.finish(0);
+      const outcome = await run;
+      assert.equal(outcome.status, "ran");
+      assert.equal(outcome.result.authMarker, true, "the marker was on the auth channel");
+      assert.equal(outcome.result.authEvidence, true);
+    });
+
     it("the same marker printed by the command after the prompt gives authEvidence:false", async () => {
       const { records, spawnFn } = makeSpawn();
       const run = runCold({

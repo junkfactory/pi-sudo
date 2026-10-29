@@ -1222,7 +1222,7 @@ describe("fingerprint learning", () => {
     }
   });
 
-  it("re-offers the reader after a typed run shows the delay again", async () => {
+  it("re-offers the reader after a typed run shows the marker again", async () => {
     const { spawnFn } = makeSequence([
       passwordRequired,
       coldNoPasswordProvided,
@@ -1249,7 +1249,7 @@ describe("fingerprint learning", () => {
       const after = await executeTool(tool, ctx, "systemctl restart nginx");
       assert.equal(after.isError, false);
       assert.equal(dialogText(calls.dialogs[2]).includes("fingerprint reader"), true,
-        "the delay seen on the typed run cleared the rejection");
+        "the marker seen on the typed run cleared the rejection");
     } finally {
       setSudoSpawnFn(undefined);
     }

@@ -569,12 +569,38 @@ describe("ApprovalDialog (fingerprint)", () => {
     for (const fingerprint of [false, true]) {
       const narrow = harness(command, "free disk space", { fingerprint });
       const gatedHeight = narrow.dialog.render(30).length;
+      assert.equal(narrow.dialog.sawEnd, false, "the long command is still gated");
       narrow.dialog.handleInput(END);
       assert.equal(
         narrow.dialog.render(30).length,
         gatedHeight,
         `no growth when the options appear at 30 columns (fingerprint: ${fingerprint})`,
       );
+    }
+  });
+
+  it("marks a hint it had to cap, instead of silently dropping the tail", () => {
+    const h = harness(`echo ${"needle ".repeat(200)}`, "free disk space", { fingerprint: true });
+    const gated = h.dialog.render(30).map(plain).join("\n");
+    h.dialog.handleInput(END);
+    const open = h.dialog.render(30).map(plain).join("\n");
+    assert.ok(gated.includes("…"), "the closed gate marks the cut");
+    assert.ok(open.includes("…"), "the wrapped hint marks the cut");
+  });
+
+  it("fits a short terminal instead of overflowing the overlay budget", () => {
+    for (const fingerprint of [false, true]) {
+      const dialog = createApprovalDialog({
+        command: `echo ${"needle ".repeat(200)}`,
+        reason: "free disk space",
+        warm: false,
+        fingerprint,
+        rows: 20,
+        theme: plainTheme,
+        done: () => {},
+      });
+      const rows = dialog.render(WIDTH).length;
+      assert.ok(rows <= 20, `frame is ${rows} rows for a 20-row budget (fingerprint: ${fingerprint})`);
     }
   });
 

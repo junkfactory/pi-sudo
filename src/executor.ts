@@ -211,9 +211,10 @@ function makeNonce(): string {
 
 /**
  * The command's own stderr is merged into its stdout, so the stderr pipe carries
- * only sudo's messages. That keeps the nonce latch unspoofable without giving
- * root a pathname to reopen: no errfile, no symlink race. The command must
- * never inherit sudo's stdin pipe: with -S it carries the password.
+ * only sudo's messages. The command cannot write that pipe, because `exec 2>&1`
+ * has already replaced its stderr descriptor; there is no errfile and no
+ * pathname it could reopen for the purpose. The command must never inherit
+ * sudo's stdin pipe: with -S it carries the password.
  */
 function buildPayload(command: string): string {
   return `exec 2>&1 0</dev/null; ${command}`;
@@ -324,7 +325,7 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
   let wroteOnce = false;
   let promptSeen = false;
   let promptDelayMs: number | null = null;
-  let authStdout = "";
+  let authText = "";
   let stdinEnded = false;
   let timedOut = false;
   let aborted = false;
@@ -429,9 +430,11 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
     if (!sudoStderr.includes(nonce)) return;
     wroteOnce = true;
     promptSeen = true;
-    // The snapshot is taken before the command exists, so command output cannot fake it.
+    // The snapshot is taken before the command exists, so command output cannot
+    // fake it. Both streams are scanned: sudo routes PAM text to stdout here, but
+    // an error-message path would land on stderr.
     promptDelayMs = Date.now() - startedAt;
-    authStdout = stdout;
+    authText = stdout + sudoStderr;
     armTimeout();
     writeSecret();
   });
@@ -470,7 +473,7 @@ async function runOnce(options: SpawnRunOptions, password: Buffer | undefined): 
         password === undefined ||
         (passwordOnly && !promptSeen && code === 0 && !timedOut && !aborted);
 
-      const authMarker = FINGERPRINT_MARKERS.test(authStdout);
+      const authMarker = FINGERPRINT_MARKERS.test(authText);
       void collectResult({
         command,
         stdout,

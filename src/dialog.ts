@@ -36,12 +36,13 @@ function innerWidth(width: number): number {
   return Math.max(MIN_INNER, width - FRAME_CHROME);
 }
 
-/** Caps wrapped rows, marking the cut so text is never dropped without a sign. */
-function capRows(lines: string[], rows: number): string[] {
+/** Caps wrapped rows, keeping `rows` lines and marking the cut on the last one. */
+function capRows(lines: string[], rows: number, width: number): string[] {
   if (lines.length <= rows) return lines;
-  const kept = lines.slice(0, Math.max(1, rows - 1));
-  const last = (kept[kept.length - 1] ?? "").replace(/\s+$/, "");
-  return [...kept.slice(0, -1), `${last}…`];
+  const kept = lines.slice(0, rows);
+  const last = (kept[rows - 1] ?? "").replace(/\s+$/, "");
+  kept[rows - 1] = `${truncateToWidth(last, Math.max(1, width - 1))}…`;
+  return kept;
 }
 
 /** Pads with spaces to `width`; the caller truncates anything longer first. */
@@ -232,14 +233,13 @@ export class ApprovalDialog implements Component, Focusable {
         : wrapTextWithAnsi(theme.fg("error", `sudo: ${this.#errorText}`), inner);
     // The reader hint is wrapped at the same width the hint rows use, once, so
     // the closed gate can reserve exactly the rows the open state will draw.
+    const readerWidth = Math.max(1, inner - COMMAND_INDENT.length);
     const readerLines = capRows(
       this.#fingerprint && !this.#warm
-        ? wrapTextWithAnsi(
-            theme.fg("dim", HINT_FINGERPRINT),
-            Math.max(1, inner - COMMAND_INDENT.length),
-          )
+        ? wrapTextWithAnsi(theme.fg("dim", HINT_FINGERPRINT), readerWidth)
         : [],
       OPTION_LABELS.length,
+      readerWidth,
     );
     const extraRows = (this.#warm ? 0 : 1) + readerLines.length;
     // Every row the preview does not own: borders, reason, command header,
@@ -255,9 +255,13 @@ export class ApprovalDialog implements Component, Focusable {
       extraRows +
       1 +
       1;
+    // A short terminal must not be over-budget: the preview shrinks to one row
+    // instead of forcing ten, so the overlay never clips the footer or border.
     const previewRows = Math.min(
       24,
-      Math.max(MAX_PREVIEW_LINES, (this.#rows ?? 0) - reserved),
+      this.#rows === undefined
+        ? MAX_PREVIEW_LINES
+        : Math.max(1, this.#rows - reserved),
     );
 
     const height = content.length;
@@ -291,12 +295,14 @@ export class ApprovalDialog implements Component, Focusable {
       // options and the password row are not drawn. Blank rows hold their place:
       // the closed gate is exactly as tall as the open one, so the centred
       // overlay does not jump when the last line arrives.
+      const hintWidth = Math.max(1, inner - COMMAND_INDENT.length);
       const hint = capRows(
         wrapTextWithAnsi(
           theme.fg(this.#gateAlert ? "error" : "warning", HINT_READ),
-          Math.max(1, inner - COMMAND_INDENT.length),
+          hintWidth,
         ),
         OPTION_LABELS.length,
+        hintWidth,
       );
       // The blank rows hold the places of the option block, the reader hint, and
       // the password row: with every block capped at the options' height, the
